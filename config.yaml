@@ -69,6 +69,7 @@ features:
   target_price: "close"
 
 model:
+  architecture: "lstm"
   type:         "lstm"
   seq_len:      30
   lstm_hidden:  128
@@ -80,10 +81,12 @@ model:
   tf_dropout:   0.1
 
 training:
+  max_epochs:     50
   epochs:         50
   batch_size:     64
   lr:             0.001
   patience:       8
+  seq_len:        30
   clip_grad:      1.0
   checkpoint_dir: "src/models/checkpoints"
 
