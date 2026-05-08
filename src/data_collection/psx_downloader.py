@@ -16,6 +16,11 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
+# ── Resolve project root (works from any working directory) ──────────
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)
+)))
+
 
 def load_config(path="config.yaml"):
     with open(path, "r") as f:
@@ -137,6 +142,7 @@ def run(cfg=None):
     """
     Accepts cfg dict from pipeline (cfg["data"]["tickers"] etc.)
     Falls back to config.yaml if cfg is None.
+    Always saves to absolute path relative to project root.
     """
     if cfg is None:
         cfg = load_config()
@@ -144,8 +150,12 @@ def run(cfg=None):
     tickers = cfg["data"]["tickers"]
     start   = cfg["data"]["start_date"]
     end     = cfg["data"]["end_date"]
-    out_dir = cfg["data"]["raw_prices_dir"]
-    os.makedirs(out_dir, exist_ok=True)
+
+    # ── Always resolve to absolute path ──────────────────────────────
+    raw_dir = cfg["data"]["raw_prices_dir"]
+    if not os.path.isabs(raw_dir):
+        raw_dir = os.path.join(PROJECT_ROOT, raw_dir)
+    os.makedirs(raw_dir, exist_ok=True)
 
     prices_raw, failed = fetch_psx_prices(tickers, start, end)
 
@@ -153,9 +163,12 @@ def run(cfg=None):
         log.warning("Tickers with no data: %s", failed)
 
     prices_df = add_technical_indicators(prices_raw)
-    out_path  = os.path.join(out_dir, "psx_prices.csv")
+
+    out_path = os.path.join(raw_dir, "psx_prices.csv")
     prices_df.to_csv(out_path, index=False)
-    log.info("Saved -> %s", out_path)
+    log.info("✓ Saved -> %s  (%d rows)", out_path, len(prices_df))
+    log.info("  File size: %.1f MB", os.path.getsize(out_path) / 1e6)
+
     return prices_df
 
 
