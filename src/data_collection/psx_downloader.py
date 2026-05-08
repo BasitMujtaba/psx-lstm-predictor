@@ -3,6 +3,10 @@ src/data_collection/psx_downloader.py
 =======================================
 Fetches OHLCV price data for PSX tickers via yfinance
 and computes technical indicators.
+
+Saves:
+  data/raw/psx_prices/psx_prices_raw.csv      <- raw OHLCV only
+  data/processed/psx_prices_processed.csv     <- OHLCV + indicators
 """
 
 import os, time, logging, warnings
@@ -13,19 +17,32 @@ import yaml
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s"
+)
 log = logging.getLogger(__name__)
 
-# ── Resolve project root (works from any working directory) ──────────
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)
 )))
 
 
-def load_config(path="config.yaml"):
+def load_config(path=None):
+    if path is None:
+        path = os.path.join(PROJECT_ROOT, "config.yaml")
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
+
+def _resolve(cfg_path):
+    """Convert relative path from config to absolute path."""
+    if os.path.isabs(cfg_path):
+        return cfg_path
+    return os.path.join(PROJECT_ROOT, cfg_path)
+
+
+# ── Step 1: Fetch raw OHLCV ───────────────────────────────────────────────────
 
 def fetch_psx_prices(tickers, start, end, sleep=0.3):
     log.info("Fetching PSX price data for %d tickers", len(tickers))
@@ -33,8 +50,10 @@ def fetch_psx_prices(tickers, start, end, sleep=0.3):
 
     for ticker in tqdm(tickers, desc="Downloading prices"):
         try:
-            raw = yf.download(ticker, start=start, end=end,
-                              auto_adjust=True, progress=False)
+            raw = yf.download(
+                ticker, start=start, end=end,
+                auto_adjust=True, progress=False
+            )
             if raw.empty:
                 log.warning("No data returned for %s", ticker)
                 failed.append(ticker)
@@ -63,10 +82,14 @@ def fetch_psx_prices(tickers, start, end, sleep=0.3):
     df = pd.concat(valid_rows, ignore_index=True)
     df.sort_values(["ticker", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
-    log.info("Price data shape: %s | Tickers loaded: %d",
-             df.shape, df["ticker"].nunique())
+    log.info(
+        "Raw OHLCV shape: %s | Tickers loaded: %d",
+        df.shape, df["ticker"].nunique()
+    )
     return df, failed
 
+
+# ── Step 2: Technical indicators ─────────────────────────────────────────────
 
 def _turbulence_1d(window):
     if len(window) < 20 or np.std(window[:-1]) == 0:
@@ -111,23 +134,30 @@ def add_technical_indicators(df):
         prev_close = close.shift(1)
         up_move    = high - prev_high
         dn_move    = prev_low - low
-        pos_dm     = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
-        neg_dm     = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
+        pos_dm     = np.where(
+                         (up_move > dn_move) & (up_move > 0), up_move, 0.0)
+        neg_dm     = np.where(
+                         (dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
         tr         = pd.concat([
                          high - low,
                          (high - prev_close).abs(),
                          (low  - prev_close).abs()
                      ], axis=1).max(axis=1)
         atr14         = tr.rolling(14).mean()
-        pdi14         = 100 * pd.Series(pos_dm).rolling(14).mean() / atr14.replace(0, np.nan)
-        ndi14         = 100 * pd.Series(neg_dm).rolling(14).mean() / atr14.replace(0, np.nan)
-        grp["dmi_dx"] = 100 * (pdi14 - ndi14).abs() / (pdi14 + ndi14).replace(0, np.nan)
+        pdi14         = (100 * pd.Series(pos_dm).rolling(14).mean()
+                         / atr14.replace(0, np.nan))
+        ndi14         = (100 * pd.Series(neg_dm).rolling(14).mean()
+                         / atr14.replace(0, np.nan))
+        grp["dmi_dx"] = (100 * (pdi14 - ndi14).abs()
+                         / (pdi14 + ndi14).replace(0, np.nan))
 
-        # Turbulence
-        grp["turbulence"] = (close.pct_change()
-                                  .rolling(252)
-                                  .apply(_turbulence_1d, raw=True)
-                                  .fillna(0.0))
+        # Turbulence (needs 252-day warmup, fills 0 until ready)
+        grp["turbulence"] = (
+            close.pct_change()
+                 .rolling(252)
+                 .apply(_turbulence_1d, raw=True)
+                 .fillna(0.0)
+        )
 
         out_frames.append(grp)
 
@@ -138,11 +168,13 @@ def add_technical_indicators(df):
     return result
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def run(cfg=None):
     """
-    Accepts cfg dict from pipeline (cfg["data"]["tickers"] etc.)
-    Falls back to config.yaml if cfg is None.
-    Always saves to absolute path relative to project root.
+    1. Fetches raw OHLCV  -> saves to data/raw/psx_prices/psx_prices_raw.csv
+    2. Adds indicators    -> saves to data/processed/psx_prices_processed.csv
+    Returns processed DataFrame.
     """
     if cfg is None:
         cfg = load_config()
@@ -151,25 +183,46 @@ def run(cfg=None):
     start   = cfg["data"]["start_date"]
     end     = cfg["data"]["end_date"]
 
-    # ── Always resolve to absolute path ──────────────────────────────
-    raw_dir = cfg["data"]["raw_prices_dir"]
-    if not os.path.isabs(raw_dir):
-        raw_dir = os.path.join(PROJECT_ROOT, raw_dir)
-    os.makedirs(raw_dir, exist_ok=True)
+    # ── Resolve directories ───────────────────────────────────────────
+    raw_dir       = _resolve(cfg["data"]["raw_prices_dir"])
+    processed_dir = _resolve(cfg["data"]["processed_dir"])
+    os.makedirs(raw_dir,       exist_ok=True)
+    os.makedirs(processed_dir, exist_ok=True)
 
-    prices_raw, failed = fetch_psx_prices(tickers, start, end)
+    log.info("raw_dir       -> %s", raw_dir)
+    log.info("processed_dir -> %s", processed_dir)
+
+    # ── Step 1: Fetch and save raw OHLCV ─────────────────────────────
+    raw_df, failed = fetch_psx_prices(tickers, start, end)
 
     if failed:
         log.warning("Tickers with no data: %s", failed)
 
-    prices_df = add_technical_indicators(prices_raw)
+    raw_path = os.path.join(raw_dir, "psx_prices_raw.csv")
+    raw_df.to_csv(raw_path, index=False)
 
-    out_path = os.path.join(raw_dir, "psx_prices.csv")
-    prices_df.to_csv(out_path, index=False)
-    log.info("✓ Saved -> %s  (%d rows)", out_path, len(prices_df))
-    log.info("  File size: %.1f MB", os.path.getsize(out_path) / 1e6)
+    if not os.path.exists(raw_path):
+        raise RuntimeError(f"Raw file was NOT saved -> {raw_path}")
+    log.info(
+        "✓ Raw OHLCV saved    -> %s  (%d rows, %.1f MB)",
+        raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6
+    )
 
-    return prices_df
+    # ── Step 2: Add indicators and save processed ─────────────────────
+    processed_df = add_technical_indicators(raw_df)
+
+    processed_path = os.path.join(processed_dir, "psx_prices_processed.csv")
+    processed_df.to_csv(processed_path, index=False)
+
+    if not os.path.exists(processed_path):
+        raise RuntimeError(f"Processed file was NOT saved -> {processed_path}")
+    log.info(
+        "✓ Processed saved    -> %s  (%d rows, %.1f MB)",
+        processed_path, len(processed_df),
+        os.path.getsize(processed_path) / 1e6
+    )
+
+    return processed_df
 
 
 if __name__ == "__main__":
