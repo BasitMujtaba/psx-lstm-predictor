@@ -406,7 +406,7 @@ def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None)
         [articles_df.reset_index(drop=True), score_df.reset_index(drop=True)], axis=1,
     )
 
-    scored_path = os.path.join(raw_news_dir, "articles_scored.csv")
+    scored_path = os.path.join(processed_dir, "articles_scored.csv")
     articles_df.to_csv(scored_path, index=False)
     log.info("✓ Scored articles saved -> %s  (%d rows)", scored_path, len(articles_df))
 
