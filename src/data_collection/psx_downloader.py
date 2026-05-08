@@ -2,7 +2,7 @@
 src/data_collection/psx_downloader.py
 =======================================
 Fetches OHLCV price data for PSX tickers via yfinance
-and computes Step 1 technical indicators.
+and computes technical indicators.
 """
 
 import os, time, logging, warnings
@@ -31,6 +31,7 @@ def fetch_psx_prices(tickers, start, end, sleep=0.3):
             raw = yf.download(ticker, start=start, end=end,
                               auto_adjust=True, progress=False)
             if raw.empty:
+                log.warning("No data returned for %s", ticker)
                 failed.append(ticker)
                 continue
 
@@ -86,18 +87,18 @@ def add_technical_indicators(df):
         grp["macd"] = ema12 - ema26
 
         # RSI
-        delta       = close.diff()
-        gain        = delta.clip(lower=0).rolling(14).mean()
-        loss        = (-delta.clip(upper=0)).rolling(14).mean()
-        rs          = gain / loss.replace(0, np.nan)
-        grp["rsi"]  = 100 - (100 / (1 + rs))
+        delta      = close.diff()
+        gain       = delta.clip(lower=0).rolling(14).mean()
+        loss       = (-delta.clip(upper=0)).rolling(14).mean()
+        rs         = gain / loss.replace(0, np.nan)
+        grp["rsi"] = 100 - (100 / (1 + rs))
 
         # CCI
-        tp          = (high + low + close) / 3
-        mad         = tp.rolling(20).apply(
-                          lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-        grp["cci"]  = (tp - tp.rolling(20).mean()) / (
-                          0.015 * mad.replace(0, np.nan))
+        tp         = (high + low + close) / 3
+        mad        = tp.rolling(20).apply(
+                         lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+        grp["cci"] = (tp - tp.rolling(20).mean()) / (
+                         0.015 * mad.replace(0, np.nan))
 
         # DMI / DX
         prev_high  = high.shift(1)
@@ -112,13 +113,12 @@ def add_technical_indicators(df):
                          (high - prev_close).abs(),
                          (low  - prev_close).abs()
                      ], axis=1).max(axis=1)
-        atr14            = tr.rolling(14).mean()
-        pdi14            = 100 * pd.Series(pos_dm).rolling(14).mean() / atr14.replace(0, np.nan)
-        ndi14            = 100 * pd.Series(neg_dm).rolling(14).mean() / atr14.replace(0, np.nan)
-        grp["dmi_dx"]    = 100 * (pdi14 - ndi14).abs() / (
-                               pdi14 + ndi14).replace(0, np.nan)
+        atr14         = tr.rolling(14).mean()
+        pdi14         = 100 * pd.Series(pos_dm).rolling(14).mean() / atr14.replace(0, np.nan)
+        ndi14         = 100 * pd.Series(neg_dm).rolling(14).mean() / atr14.replace(0, np.nan)
+        grp["dmi_dx"] = 100 * (pdi14 - ndi14).abs() / (pdi14 + ndi14).replace(0, np.nan)
 
-        # Turbulence (needs 252 days history — fills 0 until warm-up complete)
+        # Turbulence
         grp["turbulence"] = (close.pct_change()
                                   .rolling(252)
                                   .apply(_turbulence_1d, raw=True)
@@ -134,13 +134,17 @@ def add_technical_indicators(df):
 
 
 def run(cfg=None):
+    """
+    Accepts cfg dict from pipeline (cfg["data"]["tickers"] etc.)
+    Falls back to config.yaml if cfg is None.
+    """
     if cfg is None:
         cfg = load_config()
 
-    tickers   = cfg["tickers"]
-    start     = cfg["data"]["start_date"]
-    end       = cfg["data"]["end_date"]
-    out_dir   = cfg["data"]["raw_prices_dir"]
+    tickers = cfg["data"]["tickers"]
+    start   = cfg["data"]["start_date"]
+    end     = cfg["data"]["end_date"]
+    out_dir = cfg["data"]["raw_prices_dir"]
     os.makedirs(out_dir, exist_ok=True)
 
     prices_raw, failed = fetch_psx_prices(tickers, start, end)
