@@ -277,16 +277,22 @@ def align_to_trading_days(df, trading_dates):
     trading_dates = pd.DatetimeIndex(sorted(trading_dates))
 
     def _map_date(row):
-        d, hour = row["date"], row["hour"]
+        d    = pd.Timestamp(row["date"]).normalize()   # strip time, ensure Timestamp
+        hour = row["hour"]
+
+        # After-market (>= 11am PST cutoff) → push to next trading day
         if d in trading_dates and hour >= 11:
             idx = trading_dates.get_loc(d)
             if idx + 1 < len(trading_dates):
-                return trading_dates[idx + 1]
+                return trading_dates[idx + 1]   # already a scalar Timestamp
+
+        # Forward-fill to next available trading day
         future = trading_dates[trading_dates >= d]
-        return future[0] if len(future) > 0 else d
+        return future[0] if len(future) > 0 else d    # future[0] is a scalar
 
     log.info("Aligning %d articles to trading days ...", len(df))
     df = df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()   # ensure clean dates
     df["trading_date"] = df.apply(_map_date, axis=1)
     return df
 
@@ -335,39 +341,6 @@ def aggregate_daily_sentiment(df, start, end, trading_dates):
         daily[f"{cat}_score"] = daily[f"{cat}_score"].ffill().fillna(0.0)
     return daily.reset_index()
 
-
-# ── GitHub Push ───────────────────────────────────────────────────────────────
-
-def push_to_github(repo_root, commit_msg="update news_scraper.py"):
-    scraper_rel = os.path.join("src", "data_collection", "news_scraper.py")
-    cmds = [
-        ["git", "-C", repo_root, "add", scraper_rel],
-        ["git", "-C", repo_root, "commit", "-m", commit_msg],
-        ["git", "-C", repo_root, "push"],
-    ]
-    for cmd in cmds:
-        log.info("$ %s", " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.stdout:
-            log.info(result.stdout.strip())
-        if result.returncode != 0:
-            if "nothing to commit" in result.stderr + result.stdout:
-                log.info("Nothing new to commit — skipping push.")
-                return
-            log.error(result.stderr.strip())
-            raise RuntimeError(f"Git command failed: {' '.join(cmd)}\n{result.stderr}")
-    log.info("✓ news_scraper.py pushed to GitHub.")
-
-
-# ── Module Hot-Reload ─────────────────────────────────────────────────────────
-
-def reload_module(module_name="src.data_collection.news_scraper"):
-    if module_name not in sys.modules:
-        log.warning("Module '%s' not in sys.modules — importing fresh.", module_name)
-        return importlib.import_module(module_name)
-    mod = importlib.reload(sys.modules[module_name])
-    log.info("✓ Module reloaded: %s", module_name)
-    return mod
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -425,12 +398,6 @@ def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None)
         processed_path, len(sentiment_daily),
         os.path.getsize(processed_path) / 1e6,
     )
-
-    if push_github:
-        msg = github_commit_msg or (
-            f"chore: update news_scraper — {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
-        )
-        push_to_github(repo_root=PROJECT_ROOT, commit_msg=msg)
 
     return sentiment_daily
 
