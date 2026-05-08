@@ -20,6 +20,7 @@ Date alignment:
 
 import os, asyncio, logging, hashlib, warnings, importlib, subprocess, sys
 from datetime import datetime
+from urllib.parse import quote_plus
 from dateutil.relativedelta import relativedelta
 import aiohttp
 import feedparser
@@ -134,9 +135,9 @@ async def _fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk)
     after  = job["after"]
     before = job["before"]
     cat    = job["category"]
-    url    = (
-        f"{GNEWS_RSS}?q={aiohttp.helpers.requote_uri(f'{q} after:{after} before:{before}')}"
-        f"&hl=en-US&gl=PK&ceid=PK:en"
+    url = (
+      f"{GNEWS_RSS}?q={quote_plus(f'{q} after:{after} before:{before}')}"
+      f"&hl=en-US&gl=PK&ceid=PK:en"
     )
     async with semaphore:
         try:
