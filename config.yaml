@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────
+# psx-lstm-predictor  |  config.yaml
+# Central configuration for all pipeline steps
+# ─────────────────────────────────────────────
+
+data:
+  start_date: "2010-01-01"
+  end_date:   "2026-01-31"
+  train_end:  "2024-01-01"
+  test_start: "2024-01-01"
+  test_end:   "2026-01-31"
+  raw_prices_dir:    "data/raw/psx_prices"
+  raw_news_dir:      "data/raw/news"
+  processed_dir:     "data/processed"
+  predictions_dir:   "data/predictions"
+
+tickers:
+  - "PSO.KA"
+  - "OGDC.KA"
+  - "PPL.KA"
+  - "MARI.KA"
+  - "POL.KA"
+  - "HBL.KA"
+  - "MCB.KA"
+  - "UBL.KA"
+  - "NBP.KA"
+  - "BAFL.KA"
+  - "ENGRO.KA"
+  - "EFERT.KA"
+  - "FATIMA.KA"
+  - "FFC.KA"
+  - "LUCK.KA"
+  - "DGKC.KA"
+  - "MLCF.KA"
+  - "PIOC.KA"
+  - "NML.KA"
+  - "NCL.KA"
+  - "GATM.KA"
+  - "TRG.KA"
+  - "SYS.KA"
+  - "AVN.KA"
+  - "SEARL.KA"
+  - "FEROZ.KA"
+  - "INDU.KA"
+  - "PSMC.KA"
+  - "HUBC.KA"
+  - "KAPCO.KA"
+
+features:
+  # All 18 features are scale-free (ratios / % changes / bounded)
+  # so the model generalises to any future price level
+  cols:
+    - "daily_return"
+    - "log_return"
+    - "hl_range"
+    - "close_open_ratio"
+    - "volume_ratio"
+    - "rolling_vol_10"
+    - "rolling_vol_20"
+    - "price_ma5_ratio"
+    - "price_ma10_ratio"
+    - "price_ma20_ratio"
+    - "rsi"
+    - "cci"
+    - "dmi_dx"
+    - "macd_ratio"
+    - "turbulence"
+    - "sentiment_score"
+    - "lag1_return"
+    - "lag2_return"
+  target:       "daily_return"   # predict next-day return not price
+  target_price: "close"          # used only for inverse transform display
+
+model:
+  type:         "lstm"           # "lstm" or "transformer"
+  seq_len:      30               # look-back window in trading days
+  lstm_hidden:  128
+  lstm_layers:  2
+  lstm_dropout: 0.2
+  tf_d_model:   64
+  tf_nhead:     4
+  tf_layers:    2
+  tf_dropout:   0.1
+
+training:
+  epochs:         50
+  batch_size:     64
+  lr:             0.001
+  patience:       8              # early stopping patience
+  clip_grad:      1.0
+  checkpoint_dir: "src/models/checkpoints"
+
+news:
+  finbert_model:  "ProsusAI/finbert"
+  sleep_sec:      2.5
+  chunk_months:   3
+  max_per_chunk:  50
+  queries:
+    - "PSX Pakistan Stock Exchange"
+    - "KSE100 index Pakistan market"
+    - "Pakistan stock shares trading"
+    - "Karachi Stock Exchange company earnings"
+    - "PSX listed company results profit"
