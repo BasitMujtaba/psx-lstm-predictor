@@ -9,7 +9,7 @@ Saves:
   data/processed/psx_prices_processed.csv     <- OHLCV + indicators
 """
 
-import os, time, asyncio, logging, warnings
+import os, asyncio, logging, warnings
 import numpy as np
 import pandas as pd
 import aiohttp
@@ -52,6 +52,12 @@ _NUMERIC_COLS = ["ldcp", "open", "high", "low", "close", "change", "change_pct",
 # EMA periods
 _EMA_PERIODS = [9, 21, 50, 200]
 
+# Rate-limit settings
+_CONCURRENCY   = 4     # simultaneous months per ticker (keep low to avoid 429)
+_TICKER_PAUSE  = 1.5   # seconds to wait between tickers
+_429_WAIT      = 8.0   # seconds to wait on a 429 response before retrying
+_RETRY_BACKOFF = 2.0   # base back-off multiplier per retry
+
 
 def load_config(path=None):
     if path is None:
@@ -87,7 +93,7 @@ def _months_in_range(start_dt: pd.Timestamp, end_dt: pd.Timestamp):
 
 
 def _parse_table(html: str, symbol: str) -> pd.DataFrame:
-    """Parse PSX historicalTable HTML into a DataFrame."""
+    """Parse PSX historicalTable HTML into a tidy DataFrame."""
     soup  = BeautifulSoup(html, "html.parser")
     table = soup.find("table", id="historicalTable")
 
@@ -126,7 +132,7 @@ def _parse_table(html: str, symbol: str) -> pd.DataFrame:
     return df
 
 
-# ── Async fetch ───────────────────────────────────────────────────────────────
+# ── Async fetch: one month ────────────────────────────────────────────────────
 
 async def _fetch_month_async(
     session:   aiohttp.ClientSession,
@@ -134,86 +140,72 @@ async def _fetch_month_async(
     symbol:    str,
     year:      int,
     month:     int,
-    retries:   int   = 3,
-    backoff:   float = 2.0,
+    retries:   int   = 4,
 ) -> pd.DataFrame:
-    """Async POST for one (symbol, year, month) with retry + back-off."""
-    wait = backoff
+    """
+    Async POST for one (symbol, year, month).
+    - 429  -> wait _429_WAIT seconds then retry (not counted as an attempt)
+    - other error -> exponential back-off, up to `retries` attempts
+    """
     async with semaphore:
+        wait = _RETRY_BACKOFF
         for attempt in range(1, retries + 1):
             try:
                 async with session.post(
                     PSX_HISTORICAL,
                     json={"symbol": symbol, "month": str(month), "year": str(year)},
-                    timeout=aiohttp.ClientTimeout(total=20),
+                    timeout=aiohttp.ClientTimeout(total=25),
                 ) as resp:
+
+                    # Rate-limited: pause and retry without consuming an attempt
+                    if resp.status == 429:
+                        log.debug("[%s %d-%02d] 429 — waiting %.1fs",
+                                  symbol, year, month, _429_WAIT)
+                        await asyncio.sleep(_429_WAIT)
+                        continue
+
                     resp.raise_for_status()
                     html = await resp.text()
                     return _parse_table(html, symbol)
 
+            except aiohttp.ClientResponseError as exc:
+                log.warning("[%s %d-%02d] attempt %d/%d HTTP %s",
+                            symbol, year, month, attempt, retries, exc.status)
             except Exception as exc:
                 log.warning("[%s %d-%02d] attempt %d/%d: %s",
                             symbol, year, month, attempt, retries, exc)
-                if attempt < retries:
-                    await asyncio.sleep(wait)
-                    wait *= 2
+
+            if attempt < retries:
+                await asyncio.sleep(wait)
+                wait *= _RETRY_BACKOFF
 
     return pd.DataFrame()
 
 
-async def _fetch_all_async(
-    tickers:     list,
-    start_dt:    pd.Timestamp,
-    end_dt:      pd.Timestamp,
-    concurrency: int = 20,
-    retries:     int = 3,
-) -> tuple:
-    """
-    Fire all (ticker × month) jobs concurrently, capped at `concurrency`
-    simultaneous connections.
-    """
-    months    = list(_months_in_range(start_dt, end_dt))
-    semaphore = asyncio.Semaphore(concurrency)
+# ── Async fetch: one ticker (all its months) ──────────────────────────────────
 
-    # Build flat job list
-    jobs = [
-        (ticker, year, month)
-        for ticker in tickers
-        for year, month in months
+async def _fetch_ticker_async(
+    session:   aiohttp.ClientSession,
+    symbol:    str,
+    months:    list,
+    semaphore: asyncio.Semaphore,
+) -> pd.DataFrame:
+    """Fetch all months for a single ticker concurrently, bounded by semaphore."""
+    tasks = [
+        _fetch_month_async(session, semaphore, symbol, y, m)
+        for y, m in months
     ]
-    log.info(
-        "Async fetch: %d tickers × %d months = %d jobs  (concurrency=%d)",
-        len(tickers), len(months), len(jobs), concurrency,
-    )
+    frames = await asyncio.gather(*tasks)
+    frames = [f for f in frames if not f.empty]
 
-    connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
-    async with aiohttp.ClientSession(
-        headers=_HEADERS, connector=connector
-    ) as session:
-        # Seed cookies once
-        try:
-            async with session.get(PSX_PORTAL, timeout=aiohttp.ClientTimeout(total=10)):
-                pass
-        except Exception:
-            pass
+    if not frames:
+        return pd.DataFrame()
 
-        tasks = [
-            _fetch_month_async(session, semaphore,
-                               _clean_ticker(t), y, m, retries)
-            for t, y, m in jobs
-        ]
-
-        results = []
-        for coro in atqdm(
-            asyncio.as_completed(tasks),
-            total=len(tasks),
-            desc="Fetching PSX",
-        ):
-            df = await coro
-            if not df.empty:
-                results.append(df)
-
-    return results
+    combined = pd.concat(frames, ignore_index=True)
+    combined.drop_duplicates(subset=["date", "ticker"], inplace=True)
+    combined.sort_values("date", inplace=True)
+    combined.reset_index(drop=True, inplace=True)
+    return combined
 
 
 # ── Step 1: Fetch raw OHLCV ───────────────────────────────────────────────────
@@ -222,18 +214,20 @@ def fetch_psx_prices(
     tickers:     list,
     start:       str,
     end:         str,
-    concurrency: int   = 20,
-    retries:     int   = 3,
+    concurrency: int = _CONCURRENCY,
 ) -> tuple:
     """
-    Async-concurrent download of OHLCV for all tickers.
+    Downloads OHLCV for all tickers from dps.psx.com.pk.
+
+    Strategy: tickers are processed sequentially; each ticker's months
+    are fetched concurrently (capped at `concurrency`).  A short pause
+    between tickers prevents sustained rate-limit pressure.
 
     Parameters
     ----------
     tickers     : list of PSX symbols
-    start/end   : 'YYYY-MM-DD' strings
-    concurrency : max simultaneous HTTP connections
-    retries     : per-request retry attempts
+    start / end : 'YYYY-MM-DD' strings
+    concurrency : max simultaneous month-requests per ticker (default 4)
 
     Returns
     -------
@@ -241,31 +235,67 @@ def fetch_psx_prices(
     """
     start_dt = pd.Timestamp(start)
     end_dt   = pd.Timestamp(end)
+    months   = list(_months_in_range(start_dt, end_dt))
 
-    nest_asyncio.apply()
-    frames = asyncio.run(
-        _fetch_all_async(tickers, start_dt, end_dt, concurrency, retries)
+    log.info(
+        "Fetching %d ticker(s) × %d month(s)  |  concurrency=%d  |  ticker_pause=%.1fs",
+        len(tickers), len(months), concurrency, _TICKER_PAUSE,
     )
 
-    if not frames:
+    nest_asyncio.apply()
+
+    async def _run():
+        semaphore = asyncio.Semaphore(concurrency)
+        connector = aiohttp.TCPConnector(limit=concurrency * 2, ssl=False)
+        valid, failed = [], []
+
+        async with aiohttp.ClientSession(
+            headers=_HEADERS, connector=connector
+        ) as session:
+            # Seed cookies once
+            try:
+                async with session.get(
+                    PSX_PORTAL,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ):
+                    pass
+            except Exception:
+                pass
+
+            for ticker in tqdm(tickers, desc="Tickers"):
+                symbol = _clean_ticker(ticker)
+                df     = await _fetch_ticker_async(
+                             session, symbol, months, semaphore)
+
+                if df.empty:
+                    log.warning("[%s] no data — skipping", symbol)
+                    failed.append(ticker)
+                else:
+                    # Clip to exact window
+                    mask = (df["date"] >= start_dt) & (df["date"] <= end_dt)
+                    df   = df.loc[mask].reset_index(drop=True)
+                    if df.empty:
+                        failed.append(ticker)
+                    else:
+                        valid.append(df)
+                        log.info("[%s] ✓ %d rows", symbol, len(df))
+
+                # Polite pause between tickers
+                await asyncio.sleep(_TICKER_PAUSE)
+
+        return valid, failed
+
+    valid, failed = asyncio.run(_run())
+
+    if not valid:
         raise RuntimeError("No data fetched for any ticker.")
 
-    result = pd.concat(frames, ignore_index=True)
-    result.drop_duplicates(subset=["date", "ticker"], inplace=True)
-
-    # Clip to exact requested window
-    mask   = (result["date"] >= start_dt) & (result["date"] <= end_dt)
-    result = result.loc[mask].copy()
-
+    result = pd.concat(valid, ignore_index=True)
     result.sort_values(["ticker", "date"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
-    loaded  = result["ticker"].unique().tolist()
-    failed  = [t for t in [_clean_ticker(t) for t in tickers]
-               if t not in loaded]
-
     log.info("Raw OHLCV shape: %s | loaded: %d | failed: %d",
-             result.shape, len(loaded), len(failed))
+             result.shape, result["ticker"].nunique(), len(failed))
     return result, failed
 
 
