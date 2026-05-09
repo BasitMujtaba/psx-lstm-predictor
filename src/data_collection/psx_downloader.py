@@ -1,8 +1,8 @@
 """
 src/data_collection/psx_downloader.py
 =======================================
-Fetches OHLCV price data for PSX tickers via yfinance
-and computes technical indicators.
+Fetches OHLCV + LDCP, Change, Change(%) price data for PSX tickers
+via dps.psx.com.pk and computes technical indicators.
 
 Saves:
   data/raw/psx_prices/psx_prices_raw.csv      <- raw OHLCV only
@@ -10,10 +10,11 @@ Saves:
 """
 
 import os, time, logging, warnings
-import pandas as pd
 import numpy as np
-import yfinance as yf
+import pandas as pd
+import requests
 import yaml
+from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
@@ -27,6 +28,25 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)
 )))
 
+PSX_PORTAL     = "https://dps.psx.com.pk"
+PSX_HISTORICAL = f"{PSX_PORTAL}/historical"
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://dps.psx.com.pk/",
+    "Origin":          "https://dps.psx.com.pk",
+}
+
+# PSX historicalTable column order:
+# 0:Date | 1:LDCP | 2:Open | 3:High | 4:Low | 5:Close | 6:Change | 7:Change% | 8:Volume
+_NUMERIC_COLS = ["ldcp", "open", "high", "low", "close", "change", "change_pct", "volume"]
+
 
 def load_config(path=None):
     if path is None:
@@ -36,57 +56,153 @@ def load_config(path=None):
 
 
 def _resolve(cfg_path):
-    """Convert relative path from config to absolute path."""
     if os.path.isabs(cfg_path):
         return cfg_path
     return os.path.join(PROJECT_ROOT, cfg_path)
 
 
-# ── Step 1: Fetch raw OHLCV ───────────────────────────────────────────────────
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-def fetch_psx_prices(tickers, start, end, sleep=0.3):
-    log.info("Fetching PSX price data for %d tickers", len(tickers))
-    valid_rows, failed = [], []
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(_HEADERS)
+    try:
+        s.get(PSX_PORTAL, timeout=10)
+    except Exception as exc:
+        log.warning("Seed request failed (non-fatal): %s", exc)
+    return s
 
-    for ticker in tqdm(tickers, desc="Downloading prices"):
+
+def _clean_ticker(ticker: str) -> str:
+    ticker = ticker.strip().upper()
+    for suffix in (".KA", ".PK"):
+        if ticker.endswith(suffix):
+            ticker = ticker[: -len(suffix)]
+            break
+    return ticker
+
+
+def _months_in_range(start_dt: pd.Timestamp, end_dt: pd.Timestamp):
+    y, m = start_dt.year, start_dt.month
+    while (y, m) <= (end_dt.year, end_dt.month):
+        yield y, m
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+
+
+# ── Per-month fetch ───────────────────────────────────────────────────────────
+
+def _fetch_month(session, symbol, year, month, retries=3, backoff=2.0):
+    wait = backoff
+    for attempt in range(1, retries + 1):
         try:
-            raw = yf.download(
-                ticker, start=start, end=end,
-                auto_adjust=True, progress=False
+            resp = session.post(
+                PSX_HISTORICAL,
+                json={"symbol": symbol, "month": str(month), "year": str(year)},
+                timeout=20,
             )
-            if raw.empty:
-                log.warning("No data returned for %s", ticker)
-                failed.append(ticker)
-                continue
+            resp.raise_for_status()
 
-            raw = raw.reset_index()
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = [c[0].lower() for c in raw.columns]
-            else:
-                raw.columns = [c.lower() for c in raw.columns]
+            soup  = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table", id="historicalTable")
 
-            needed = ["date", "open", "high", "low", "close", "volume"]
-            raw    = raw[[c for c in needed if c in raw.columns]].copy()
-            raw["ticker"] = ticker
-            raw["date"]   = pd.to_datetime(raw["date"]).dt.normalize()
-            valid_rows.append(raw)
-            time.sleep(sleep)
+            if not table or not table.find("tbody"):
+                return pd.DataFrame()
+
+            rows = []
+            for tr in table.find("tbody").find_all("tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 9:
+                    continue
+                rows.append({
+                    "date":       tds[0].get_text(strip=True),
+                    "ldcp":       tds[1].get_text(strip=True).replace(",", ""),
+                    "open":       tds[2].get_text(strip=True).replace(",", ""),
+                    "high":       tds[3].get_text(strip=True).replace(",", ""),
+                    "low":        tds[4].get_text(strip=True).replace(",", ""),
+                    "close":      tds[5].get_text(strip=True).replace(",", ""),
+                    "change":     tds[6].get_text(strip=True).replace(",", ""),
+                    "change_pct": tds[7].get_text(strip=True).replace(",", "").replace("%", ""),
+                    "volume":     tds[8].get_text(strip=True).replace(",", ""),
+                })
+
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            for col in _NUMERIC_COLS:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df.dropna(subset=["date", "close"], inplace=True)
+            df["ticker"] = symbol
+            df.sort_values("date", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            return df
 
         except Exception as exc:
-            log.error("Failed %s: %s", ticker, exc)
+            log.warning("[%s %d-%02d] attempt %d/%d: %s",
+                        symbol, year, month, attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(wait)
+                wait *= 2
+
+    return pd.DataFrame()
+
+
+# ── Step 1: Fetch raw OHLCV ───────────────────────────────────────────────────
+
+def fetch_psx_prices(tickers, start, end, sleep=0.35):
+    start_dt = pd.Timestamp(start)
+    end_dt   = pd.Timestamp(end)
+    months   = list(_months_in_range(start_dt, end_dt))
+
+    log.info("Fetching %d tickers × %d months from %s",
+             len(tickers), len(months), PSX_PORTAL)
+
+    session    = _make_session()
+    valid_rows = []
+    failed     = []
+
+    for ticker in tqdm(tickers, desc="Tickers"):
+        symbol    = _clean_ticker(ticker)
+        month_dfs = []
+
+        for year, month in tqdm(months, desc=f"  {symbol}", leave=False):
+            df = _fetch_month(session, symbol, year, month)
+            if not df.empty:
+                month_dfs.append(df)
+            time.sleep(sleep)
+
+        if not month_dfs:
+            log.warning("[%s] No data fetched – skipping", symbol)
             failed.append(ticker)
+            continue
+
+        combined = pd.concat(month_dfs, ignore_index=True)
+        combined.drop_duplicates(subset=["date", "ticker"], inplace=True)
+        combined.sort_values("date", inplace=True)
+        combined.reset_index(drop=True, inplace=True)
+
+        mask     = (combined["date"] >= start_dt) & (combined["date"] <= end_dt)
+        combined = combined.loc[mask].reset_index(drop=True)
+
+        if combined.empty:
+            failed.append(ticker)
+        else:
+            valid_rows.append(combined)
 
     if not valid_rows:
-        raise RuntimeError("No price data fetched.")
+        raise RuntimeError("No data fetched for any ticker.")
 
-    df = pd.concat(valid_rows, ignore_index=True)
-    df.sort_values(["ticker", "date"], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    log.info(
-        "Raw OHLCV shape: %s | Tickers loaded: %d",
-        df.shape, df["ticker"].nunique()
-    )
-    return df, failed
+    result = pd.concat(valid_rows, ignore_index=True)
+    result.sort_values(["ticker", "date"], inplace=True)
+    result.reset_index(drop=True, inplace=True)
+
+    log.info("Raw OHLCV shape: %s | loaded: %d | failed: %d",
+             result.shape, result["ticker"].nunique(), len(failed))
+    return result, failed
 
 
 # ── Step 2: Technical indicators ─────────────────────────────────────────────
@@ -94,88 +210,71 @@ def fetch_psx_prices(tickers, start, end, sleep=0.3):
 def _turbulence_1d(window):
     if len(window) < 20 or np.std(window[:-1]) == 0:
         return 0.0
-    mu  = np.mean(window[:-1])
-    sig = np.std(window[:-1])
+    mu, sig = np.mean(window[:-1]), np.std(window[:-1])
     return float(((window[-1] - mu) / sig) ** 2)
 
 
 def add_technical_indicators(df):
     log.info("Computing technical indicators")
-    out_frames = []
+    frames = []
 
     for ticker, grp in tqdm(df.groupby("ticker"), desc="Indicators"):
-        grp   = grp.copy().sort_values("date").reset_index(drop=True)
-        close = grp["close"]
-        high  = grp["high"]
-        low   = grp["low"]
+        g                = grp.copy().sort_values("date").reset_index(drop=True)
+        close, high, low = g["close"], g["high"], g["low"]
 
         # MACD
-        ema12       = close.ewm(span=12, adjust=False).mean()
-        ema26       = close.ewm(span=26, adjust=False).mean()
-        grp["macd"] = ema12 - ema26
+        g["macd"] = (close.ewm(span=12, adjust=False).mean()
+                     - close.ewm(span=26, adjust=False).mean())
 
-        # RSI
-        delta      = close.diff()
-        gain       = delta.clip(lower=0).rolling(14).mean()
-        loss       = (-delta.clip(upper=0)).rolling(14).mean()
-        rs         = gain / loss.replace(0, np.nan)
-        grp["rsi"] = 100 - (100 / (1 + rs))
+        # RSI-14
+        delta    = close.diff()
+        rs       = (delta.clip(lower=0).rolling(14).mean()
+                    / (-delta.clip(upper=0)).rolling(14).mean().replace(0, np.nan))
+        g["rsi"] = 100 - (100 / (1 + rs))
 
-        # CCI
-        tp         = (high + low + close) / 3
-        mad        = tp.rolling(20).apply(
-                         lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-        grp["cci"] = (tp - tp.rolling(20).mean()) / (
-                         0.015 * mad.replace(0, np.nan))
+        # CCI-20
+        tp       = (high + low + close) / 3
+        mad      = tp.rolling(20).apply(
+                       lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+        g["cci"] = (tp - tp.rolling(20).mean()) / (0.015 * mad.replace(0, np.nan))
 
-        # DMI / DX
-        prev_high  = high.shift(1)
-        prev_low   = low.shift(1)
+        # DMI / DX-14
         prev_close = close.shift(1)
-        up_move    = high - prev_high
-        dn_move    = prev_low - low
-        pos_dm     = np.where(
-                         (up_move > dn_move) & (up_move > 0), up_move, 0.0)
-        neg_dm     = np.where(
-                         (dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
-        tr         = pd.concat([
-                         high - low,
-                         (high - prev_close).abs(),
-                         (low  - prev_close).abs()
-                     ], axis=1).max(axis=1)
-        atr14         = tr.rolling(14).mean()
-        pdi14         = (100 * pd.Series(pos_dm).rolling(14).mean()
-                         / atr14.replace(0, np.nan))
-        ndi14         = (100 * pd.Series(neg_dm).rolling(14).mean()
-                         / atr14.replace(0, np.nan))
-        grp["dmi_dx"] = (100 * (pdi14 - ndi14).abs()
-                         / (pdi14 + ndi14).replace(0, np.nan))
+        up_move    = high - high.shift(1)
+        dn_move    = low.shift(1) - low
+        pos_dm     = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
+        neg_dm     = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
+        tr         = pd.concat([high - low,
+                                 (high - prev_close).abs(),
+                                 (low  - prev_close).abs()], axis=1).max(axis=1)
+        atr14       = tr.rolling(14).mean()
+        pdi14       = (100 * pd.Series(pos_dm, index=g.index).rolling(14).mean()
+                       / atr14.replace(0, np.nan))
+        ndi14       = (100 * pd.Series(neg_dm, index=g.index).rolling(14).mean()
+                       / atr14.replace(0, np.nan))
+        g["dmi_dx"] = (100 * (pdi14 - ndi14).abs()
+                       / (pdi14 + ndi14).replace(0, np.nan))
 
-        # Turbulence (needs 252-day warmup, fills 0 until ready)
-        grp["turbulence"] = (
-            close.pct_change()
-                 .rolling(252)
-                 .apply(_turbulence_1d, raw=True)
-                 .fillna(0.0)
-        )
+        # Turbulence
+        g["turbulence"] = (close.pct_change()
+                               .rolling(252)
+                               .apply(_turbulence_1d, raw=True)
+                               .fillna(0.0))
+        frames.append(g)
 
-        out_frames.append(grp)
-
-    result = pd.concat(out_frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
     result.sort_values(["ticker", "date"], inplace=True)
     result.reset_index(drop=True, inplace=True)
-    log.info("Indicators added. Shape: %s", result.shape)
+
+    nan_pct = (result[["macd", "rsi", "cci", "dmi_dx", "turbulence"]]
+               .isna().mean().mul(100).round(1))
+    log.info("NaN %% per indicator:\n%s", nan_pct.to_string())
     return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run(cfg=None):
-    """
-    1. Fetches raw OHLCV  -> saves to data/raw/psx_prices/psx_prices_raw.csv
-    2. Adds indicators    -> saves to data/processed/psx_prices_processed.csv
-    Returns processed DataFrame.
-    """
     if cfg is None:
         cfg = load_config()
 
@@ -183,7 +282,6 @@ def run(cfg=None):
     start   = cfg["data"]["start_date"]
     end     = cfg["data"]["end_date"]
 
-    # ── Resolve directories ───────────────────────────────────────────
     raw_dir       = _resolve(cfg["data"]["raw_prices_dir"])
     processed_dir = _resolve(cfg["data"]["processed_dir"])
     os.makedirs(raw_dir,       exist_ok=True)
@@ -192,35 +290,21 @@ def run(cfg=None):
     log.info("raw_dir       -> %s", raw_dir)
     log.info("processed_dir -> %s", processed_dir)
 
-    # ── Step 1: Fetch and save raw OHLCV ─────────────────────────────
     raw_df, failed = fetch_psx_prices(tickers, start, end)
-
     if failed:
         log.warning("Tickers with no data: %s", failed)
 
     raw_path = os.path.join(raw_dir, "psx_prices_raw.csv")
     raw_df.to_csv(raw_path, index=False)
+    log.info("✓ Raw OHLCV saved    -> %s  (%d rows, %.1f MB)",
+             raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
 
-    if not os.path.exists(raw_path):
-        raise RuntimeError(f"Raw file was NOT saved -> {raw_path}")
-    log.info(
-        "✓ Raw OHLCV saved    -> %s  (%d rows, %.1f MB)",
-        raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6
-    )
-
-    # ── Step 2: Add indicators and save processed ─────────────────────
-    processed_df = add_technical_indicators(raw_df)
-
+    processed_df   = add_technical_indicators(raw_df)
     processed_path = os.path.join(processed_dir, "psx_prices_processed.csv")
     processed_df.to_csv(processed_path, index=False)
-
-    if not os.path.exists(processed_path):
-        raise RuntimeError(f"Processed file was NOT saved -> {processed_path}")
-    log.info(
-        "✓ Processed saved    -> %s  (%d rows, %.1f MB)",
-        processed_path, len(processed_df),
-        os.path.getsize(processed_path) / 1e6
-    )
+    log.info("✓ Processed saved    -> %s  (%d rows, %.1f MB)",
+             processed_path, len(processed_df),
+             os.path.getsize(processed_path) / 1e6)
 
     return processed_df
 
