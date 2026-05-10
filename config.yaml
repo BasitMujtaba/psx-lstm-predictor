@@ -72,9 +72,9 @@ model:
   architecture: "lstm"           # matches build_model() check
   type:         "lstm"           # "lstm" or "transformer"
   seq_len:      30               # look-back window in trading days
-  lstm_hidden:  128
-  lstm_layers:  2
-  lstm_dropout: 0.2
+  lstm_hidden:  256              # increased from 128 — more capacity
+  lstm_layers:  3                # increased from 2 — deeper network
+  lstm_dropout: 0.3              # increased slightly to combat overfitting
   tf_d_model:   64
   tf_nhead:     4
   tf_layers:    2
@@ -82,16 +82,16 @@ model:
   input_size:   32               # confirmed by DataLoader: X shape [64, 30, 32]
 
 training:
-  max_epochs:     50             # read by trainer.py
-  epochs:         50             # legacy alias
-  batch_size:     64
-  lr:             0.001
-  patience:       8              # early-stopping patience
+  max_epochs:     150            # increased from 50 — more room to converge
+  epochs:         150            # legacy alias
+  batch_size:     32             # reduced from 64 — better gradient estimates
+  lr:             0.0005         # reduced from 0.001 — slower, more careful learning
+  patience:       20             # increased from 8 — more time before stopping
   seq_len:        30             # sequence length for DataLoader
-  grad_clip:      1.0            # renamed from clip_grad
+  grad_clip:      1.0
   weight_decay:   0.0001         # Adam L2 regularisation
   lr_factor:      0.5            # ReduceLROnPlateau factor
-  lr_patience:    7              # ReduceLROnPlateau patience
+  lr_patience:    5              # reduced from 7 — reduce LR sooner when stuck
   num_workers:    2              # DataLoader worker threads
   checkpoint_dir: "src/models/checkpoints"
 
