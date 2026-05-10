@@ -47,29 +47,52 @@ data:
 
 features:
   cols:
+    # ── MACD family ───────────────────────────────────────
     - "macd_pct"
     - "macd_sig_pct"
     - "macd_hist_pct"
+    # ── Momentum oscillators ──────────────────────────────
     - "rsi_norm"
     - "cci_norm"
+    - "williams_r_norm"
+    - "stoch_k_norm"
+    - "stoch_d_norm"
+    - "roc_5_norm"
+    - "roc_10_norm"
+    # ── Directional movement ──────────────────────────────
     - "di_plus_norm"
     - "di_minus_norm"
     - "adx_norm"
     - "di_diff_norm"
+    # ── Volatility ────────────────────────────────────────
     - "atr_pct"
     - "bb_pct_b"
     - "bb_width"
+    - "rolling_vol_10"
+    - "rolling_vol_20"
+    - "parkinson_vol"
+    # ── Volume ────────────────────────────────────────────
     - "obv_pct"
+    - "volume_ma5_ratio"
+    - "volume_ma20_ratio"
+    # ── Price structure ───────────────────────────────────
     - "turbulence"
     - "close_to_high"
     - "close_to_low"
     - "high_low_range_pct"
     - "gap_pct"
+    # ── Lagged returns ────────────────────────────────────
     - "ret_1d"
     - "ret_5d"
     - "ret_10d"
     - "ret_20d"
+    - "ret_60d"
+    # ── Cross-sectional ───────────────────────────────────
     - "vol_ratio_5_20"
+    - "market_return"
+    - "relative_strength"
+    - "sector_return"
+    # ── Sentiment ─────────────────────────────────────────
     - "sentiment_score"
     - "macro_pakistan_score"
     - "psx_market_score"
@@ -79,36 +102,49 @@ features:
     - "political_stability_score"
     - "pakistani_media_score"
     - "international_media_pakistan_score"
+    - "sentiment_ma5"
   target:       "daily_return"
   target_price: "close"
+  n_features:   50             # must equal len(cols)
 
 model:
   architecture:    "lstm"
   type:            "lstm"
-  seq_len:         20
-  lstm_hidden:     128
-  lstm_layers:     2
-  lstm_dropout:    0.2
-  tf_d_model:      64
+  seq_len:         60
+  input_size:      50          # must match features.n_features
+  lstm_hidden:     256
+  lstm_layers:     4
+  lstm_dropout:    0.3
+  num_heads:       8           # intra-scale temporal attention heads
+  cross_heads:     4           # cross-scale attention heads
+  fc_hidden:       256
+  use_ensemble:    true
+  xgb_trees:       1000
+  xgb_depth:       6
+  xgb_lr:          0.02
+  rf_trees:        500
+  rf_depth:        14
+  tf_d_model:      64          # legacy transformer keys (unused when type=lstm)
   tf_nhead:        4
   tf_layers:       2
   tf_dropout:      0.1
-  input_size:      32            # confirmed — len(FEATURE_COLS) = 32
   checkpoints_dir: "src/models/checkpoints"
 
 training:
-  max_epochs:     30
-  epochs:         30
-  batch_size:     64
-  lr:             0.001
-  patience:       30             # matches max_epochs — no early stopping
-  seq_len:        20
-  grad_clip:      1.0
-  weight_decay:   0.0001
-  lr_factor:      0.5
-  lr_patience:    5
-  num_workers:    4
-  checkpoint_dir: "src/models/checkpoints"
+  max_epochs:      80
+  epochs:          80
+  batch_size:      32
+  lr:              0.0003
+  patience:        15          # early stop if no improvement for 15 epochs
+  seq_len:         60          # must match model.seq_len
+  grad_clip:       0.5
+  weight_decay:    0.0001
+  lr_factor:       0.4
+  lr_patience:     5
+  num_workers:     2
+  checkpoint_dir:  "src/models/checkpoints"
+  loss:            "gaussian_nll"
+  warmup_epochs:   5
 
 news:
   finbert_model: "ProsusAI/finbert"
