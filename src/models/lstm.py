@@ -1,10 +1,22 @@
 """
 src/models/lstm.py
 ====================
-LSTM architecture for PSX return prediction.
+Enhanced LSTM with multi-head attention, residual connections,
+and a deeper FC head for PSX return prediction.
 
 input  : (batch, seq_len, n_features)   float32
 output : (batch,)                       float32  scaled return
+
+Architecture
+------------
+  Input
+    -> Feature projection (linear embedding)
+    -> Stacked Bidirectional LSTM
+    -> Multi-Head Self-Attention over LSTM outputs
+    -> Residual connection + LayerNorm
+    -> Temporal pooling (mean + max concatenated)
+    -> Deep FC head with GELU + Dropout
+  Output (B,)
 
 config.yaml section used:
   model:
@@ -19,23 +31,42 @@ config.yaml section used:
 import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
 
 
+class TemporalAttention(nn.Module):
+    """
+    Multi-head self-attention over the time dimension.
+    Allows the model to focus on the most relevant timesteps.
+    """
+    def __init__(self, hidden_size, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim   = hidden_size,
+            num_heads   = num_heads,
+            dropout     = dropout,
+            batch_first = True,
+        )
+        self.norm    = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, seq_len, hidden_size)
+        attn_out, _ = self.attention(x, x, x)
+        return self.norm(x + self.dropout(attn_out))   # residual
+
+
 class PSXLSTMModel(nn.Module):
     """
-    Stacked LSTM with a two-layer FC regression head.
-
-    Architecture
-    ------------
-    Input  (B, seq_len, input_size)
-      -> LSTM (num_layers, hidden_size, dropout between layers)
-      -> last hidden state  (B, hidden_size)
-      -> LayerNorm
-      -> FC(hidden_size -> fc_hidden)  + ReLU + Dropout
-      -> FC(fc_hidden   -> 1)
-    Output (B,)
+    Enhanced LSTM model with:
+      - Input feature projection
+      - Bidirectional LSTM (captures past + future context in sequence)
+      - Multi-head temporal attention
+      - Residual connections + LayerNorm
+      - Mean + max temporal pooling
+      - Deep GELU FC head
     """
 
     def __init__(self, input_size=32, hidden_size=128,
@@ -45,27 +76,56 @@ class PSXLSTMModel(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers  = num_layers
 
+        # ── Feature projection ─────────────────────────────────────────
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+        )
+
+        # ── Bidirectional LSTM ─────────────────────────────────────────
         self.lstm = nn.LSTM(
-            input_size  = input_size,
+            input_size  = hidden_size,
             hidden_size = hidden_size,
             num_layers  = num_layers,
             dropout     = dropout if num_layers > 1 else 0.0,
             batch_first = True,
+            bidirectional = True,
         )
 
-        self.layer_norm = nn.LayerNorm(hidden_size)
+        lstm_out_size = hidden_size * 2   # bidirectional
 
+        # ── Project bidir output back to hidden_size for attention ─────
+        self.lstm_proj = nn.Linear(lstm_out_size, hidden_size)
+
+        # ── Temporal attention ─────────────────────────────────────────
+        self.attention = TemporalAttention(
+            hidden_size = hidden_size,
+            num_heads   = 4,
+            dropout     = dropout,
+        )
+
+        # ── LayerNorm after attention ──────────────────────────────────
+        self.norm = nn.LayerNorm(hidden_size)
+
+        # ── FC head (mean + max pooling concatenated) ──────────────────
+        # input = hidden_size * 2 (mean-pool + max-pool)
+        fc_in = hidden_size * 2
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, fc_hidden),
-            nn.ReLU(),
+            nn.Linear(fc_in, fc_hidden * 2),
+            nn.LayerNorm(fc_hidden * 2),
+            nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(fc_hidden * 2, fc_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
             nn.Linear(fc_hidden, 1),
         )
 
         self._init_weights()
         log.info(
-            "PSXLSTMModel  input=%d  hidden=%d  layers=%d  "
-            "dropout=%.2f  fc_hidden=%d",
+            "PSXLSTMModel (enhanced)  input=%d  hidden=%d  layers=%d  "
+            "dropout=%.2f  fc_hidden=%d  bidirectional=True  attention=True",
             input_size, hidden_size, num_layers, dropout, fc_hidden,
         )
 
@@ -75,10 +135,11 @@ class PSXLSTMModel(nn.Module):
                 nn.init.xavier_uniform_(param)
             elif "bias" in name:
                 nn.init.zeros_(param)
-        for layer in self.fc:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         """
@@ -90,10 +151,24 @@ class PSXLSTMModel(nn.Module):
         -------
         out : (B,)
         """
-        lstm_out, (h_n, _) = self.lstm(x)
-        last_hidden = h_n[-1]
-        last_hidden = self.layer_norm(last_hidden)
-        out = self.fc(last_hidden).squeeze(-1)
+        # ── Project input features ─────────────────────────────────────
+        x = self.input_proj(x)                      # (B, seq, hidden)
+
+        # ── Bidirectional LSTM ─────────────────────────────────────────
+        lstm_out, _ = self.lstm(x)                  # (B, seq, hidden*2)
+        lstm_out    = self.lstm_proj(lstm_out)       # (B, seq, hidden)
+
+        # ── Residual + attention ───────────────────────────────────────
+        attn_out = self.attention(lstm_out)          # (B, seq, hidden)
+        attn_out = self.norm(attn_out + lstm_out)    # residual
+
+        # ── Temporal pooling ───────────────────────────────────────────
+        mean_pool = attn_out.mean(dim=1)             # (B, hidden)
+        max_pool  = attn_out.max(dim=1).values       # (B, hidden)
+        pooled    = torch.cat([mean_pool, max_pool], dim=-1)  # (B, hidden*2)
+
+        # ── FC head ────────────────────────────────────────────────────
+        out = self.fc(pooled).squeeze(-1)            # (B,)
         return out
 
 
@@ -113,11 +188,12 @@ def build_model(cfg):
     model = PSXLSTMModel(
         input_size  = m.get("input_size",   32),
         hidden_size = m.get("lstm_hidden",  128),
-        num_layers  = m.get("lstm_layers",  2),
+        num_layers  = m.get("lstm_layers",   2),
         dropout     = m.get("lstm_dropout", 0.2),
         fc_hidden   = m.get("fc_hidden",    64),
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info("Model built: LSTM  |  trainable params: %s", f"{n_params:,}")
+    log.info("Model built: Enhanced LSTM  |  trainable params: %s",
+             f"{n_params:,}")
     return model
