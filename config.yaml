@@ -103,15 +103,15 @@ features:
     - "pakistani_media_score"
     - "international_media_pakistan_score"
     - "sentiment_ma5"
-  target:       "daily_return"
+  target:       "ret_1d_future"
   target_price: "close"
-  n_features:   50             # must equal len(cols)
+  n_features:   47
 
 model:
   architecture:    "lstm"
   type:            "lstm"
   seq_len:         60
-  input_size:      50
+  input_size:      47
   lstm_hidden:     256
   lstm_layers:     4
   lstm_dropout:    0.3
@@ -134,7 +134,7 @@ training:
   max_epochs:      80
   epochs:          80
   batch_size:      32
-  lr:              0.001       # increased from 0.0003
+  lr:              0.001
   patience:        15
   seq_len:         60
   grad_clip:       0.5
