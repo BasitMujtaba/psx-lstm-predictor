@@ -1,12 +1,13 @@
 """
 src/data_collection/psx_downloader.py
 =======================================
-Fetches OHLCV + LDCP, Change, Change(%) price data for PSX tickers
-via dps.psx.com.pk and computes technical indicators.
+Fetches OHLCV price data for PSX tickers via dps.psx.com.pk,
+derives LDCP / Change / Change(%) from close prices,
+and computes technical indicators.
 
 Saves:
-  data/raw/psx_prices/psx_prices_raw.csv      <- raw OHLCV only
-  data/processed/psx_prices_processed.csv     <- OHLCV + indicators
+  data/raw/psx_prices/psx_prices_raw.csv      <- OHLCV + LDCP + Change + Change(%)
+  data/processed/psx_prices_processed.csv     <- raw cols + all indicators
 """
 
 import os, asyncio, logging, warnings
@@ -17,7 +18,6 @@ import nest_asyncio
 import yaml
 from bs4 import BeautifulSoup
 from tqdm.notebook import tqdm
-from tqdm.asyncio import tqdm as atqdm
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(
@@ -45,18 +45,18 @@ _HEADERS = {
     "Origin":          "https://dps.psx.com.pk",
 }
 
-# PSX historicalTable column order:
-# 0:Date | 1:LDCP | 2:Open | 3:High | 4:Low | 5:Close | 6:Change | 7:Change% | 8:Volume
-_NUMERIC_COLS = ["ldcp", "open", "high", "low", "close", "change", "change_pct", "volume"]
+# Actual PSX historicalTable columns (6 cols):
+# 0:Date | 1:Open | 2:High | 3:Low | 4:Close | 5:Volume
+_NUMERIC_COLS = ["open", "high", "low", "close", "volume"]
 
 # EMA periods
 _EMA_PERIODS = [9, 21, 50, 200]
 
 # Rate-limit settings
-_CONCURRENCY   = 4     # simultaneous months per ticker (keep low to avoid 429)
-_TICKER_PAUSE  = 1.5   # seconds to wait between tickers
-_429_WAIT      = 8.0   # seconds to wait on a 429 response before retrying
-_RETRY_BACKOFF = 2.0   # base back-off multiplier per retry
+_CONCURRENCY   = 4
+_TICKER_PAUSE  = 1.5
+_429_WAIT      = 8.0
+_RETRY_BACKOFF = 2.0
 
 
 def load_config(path=None):
@@ -93,7 +93,11 @@ def _months_in_range(start_dt: pd.Timestamp, end_dt: pd.Timestamp):
 
 
 def _parse_table(html: str, symbol: str) -> pd.DataFrame:
-    """Parse PSX historicalTable HTML into a tidy DataFrame."""
+    """
+    Parse PSX historicalTable HTML.
+    API returns 6 cols: DATE | OPEN | HIGH | LOW | CLOSE | VOLUME
+    LDCP / Change / Change(%) are derived separately after fetch.
+    """
     soup  = BeautifulSoup(html, "html.parser")
     table = soup.find("table", id="historicalTable")
 
@@ -103,18 +107,15 @@ def _parse_table(html: str, symbol: str) -> pd.DataFrame:
     rows = []
     for tr in table.find("tbody").find_all("tr"):
         tds = tr.find_all("td")
-        if len(tds) < 9:
+        if len(tds) < 6:
             continue
         rows.append({
-            "date":       tds[0].get_text(strip=True),
-            "ldcp":       tds[1].get_text(strip=True).replace(",", ""),
-            "open":       tds[2].get_text(strip=True).replace(",", ""),
-            "high":       tds[3].get_text(strip=True).replace(",", ""),
-            "low":        tds[4].get_text(strip=True).replace(",", ""),
-            "close":      tds[5].get_text(strip=True).replace(",", ""),
-            "change":     tds[6].get_text(strip=True).replace(",", ""),
-            "change_pct": tds[7].get_text(strip=True).replace(",", "").replace("%", ""),
-            "volume":     tds[8].get_text(strip=True).replace(",", ""),
+            "date":   tds[0].get_text(strip=True),
+            "open":   tds[1].get_text(strip=True).replace(",", ""),
+            "high":   tds[2].get_text(strip=True).replace(",", ""),
+            "low":    tds[3].get_text(strip=True).replace(",", ""),
+            "close":  tds[4].get_text(strip=True).replace(",", ""),
+            "volume": tds[5].get_text(strip=True).replace(",", ""),
         })
 
     if not rows:
@@ -132,6 +133,28 @@ def _parse_table(html: str, symbol: str) -> pd.DataFrame:
     return df
 
 
+def _derive_ldcp_change(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive LDCP, Change, Change(%) per ticker from close prices.
+
+      ldcp        = previous trading day close
+      change      = close - ldcp
+      change_pct  = (change / ldcp) * 100  rounded to 2 dp
+
+    First row per ticker is NaN (no prior day) — correct behaviour.
+    """
+    df = df.copy()
+    df["ldcp"]       = df.groupby("ticker")["close"].shift(1)
+    df["change"]     = (df["close"] - df["ldcp"]).round(2)
+    df["change_pct"] = ((df["change"] / df["ldcp"]) * 100).round(2)
+
+    # Reorder columns: date, ticker, ldcp, open, high, low, close, change, change_pct, volume
+    col_order = ["date", "ticker", "ldcp",
+                 "open", "high", "low", "close",
+                 "change", "change_pct", "volume"]
+    return df[col_order]
+
+
 # ── Async fetch: one month ────────────────────────────────────────────────────
 
 async def _fetch_month_async(
@@ -140,13 +163,8 @@ async def _fetch_month_async(
     symbol:    str,
     year:      int,
     month:     int,
-    retries:   int   = 4,
+    retries:   int = 4,
 ) -> pd.DataFrame:
-    """
-    Async POST for one (symbol, year, month).
-    - 429  -> wait _429_WAIT seconds then retry (not counted as an attempt)
-    - other error -> exponential back-off, up to `retries` attempts
-    """
     async with semaphore:
         wait = _RETRY_BACKOFF
         for attempt in range(1, retries + 1):
@@ -157,7 +175,6 @@ async def _fetch_month_async(
                     timeout=aiohttp.ClientTimeout(total=25),
                 ) as resp:
 
-                    # Rate-limited: pause and retry without consuming an attempt
                     if resp.status == 429:
                         log.debug("[%s %d-%02d] 429 — waiting %.1fs",
                                   symbol, year, month, _429_WAIT)
@@ -182,7 +199,7 @@ async def _fetch_month_async(
     return pd.DataFrame()
 
 
-# ── Async fetch: one ticker (all its months) ──────────────────────────────────
+# ── Async fetch: one ticker (all months) ─────────────────────────────────────
 
 async def _fetch_ticker_async(
     session:   aiohttp.ClientSession,
@@ -190,11 +207,8 @@ async def _fetch_ticker_async(
     months:    list,
     semaphore: asyncio.Semaphore,
 ) -> pd.DataFrame:
-    """Fetch all months for a single ticker concurrently, bounded by semaphore."""
-    tasks = [
-        _fetch_month_async(session, semaphore, symbol, y, m)
-        for y, m in months
-    ]
+    tasks  = [_fetch_month_async(session, semaphore, symbol, y, m)
+              for y, m in months]
     frames = await asyncio.gather(*tasks)
     frames = [f for f in frames if not f.empty]
 
@@ -208,7 +222,7 @@ async def _fetch_ticker_async(
     return combined
 
 
-# ── Step 1: Fetch raw OHLCV ───────────────────────────────────────────────────
+# ── Step 1: Fetch raw OHLCV + derive LDCP/Change ─────────────────────────────
 
 def fetch_psx_prices(
     tickers:     list,
@@ -217,28 +231,18 @@ def fetch_psx_prices(
     concurrency: int = _CONCURRENCY,
 ) -> tuple:
     """
-    Downloads OHLCV for all tickers from dps.psx.com.pk.
+    Downloads OHLCV for all tickers then derives LDCP, Change, Change(%).
+    Returns (raw_df, failed_tickers).
 
-    Strategy: tickers are processed sequentially; each ticker's months
-    are fetched concurrently (capped at `concurrency`).  A short pause
-    between tickers prevents sustained rate-limit pressure.
-
-    Parameters
-    ----------
-    tickers     : list of PSX symbols
-    start / end : 'YYYY-MM-DD' strings
-    concurrency : max simultaneous month-requests per ticker (default 4)
-
-    Returns
-    -------
-    (combined_df, failed_tickers)
+    raw_df columns:
+      date, ticker, ldcp, open, high, low, close, change, change_pct, volume
     """
     start_dt = pd.Timestamp(start)
     end_dt   = pd.Timestamp(end)
     months   = list(_months_in_range(start_dt, end_dt))
 
     log.info(
-        "Fetching %d ticker(s) × %d month(s)  |  concurrency=%d  |  ticker_pause=%.1fs",
+        "Fetching %d ticker(s) × %d month(s)  |  concurrency=%d  |  pause=%.1fs",
         len(tickers), len(months), concurrency, _TICKER_PAUSE,
     )
 
@@ -252,26 +256,21 @@ def fetch_psx_prices(
         async with aiohttp.ClientSession(
             headers=_HEADERS, connector=connector
         ) as session:
-            # Seed cookies once
             try:
-                async with session.get(
-                    PSX_PORTAL,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ):
+                async with session.get(PSX_PORTAL,
+                                       timeout=aiohttp.ClientTimeout(total=10)):
                     pass
             except Exception:
                 pass
 
             for ticker in tqdm(tickers, desc="Tickers"):
                 symbol = _clean_ticker(ticker)
-                df     = await _fetch_ticker_async(
-                             session, symbol, months, semaphore)
+                df     = await _fetch_ticker_async(session, symbol, months, semaphore)
 
                 if df.empty:
                     log.warning("[%s] no data — skipping", symbol)
                     failed.append(ticker)
                 else:
-                    # Clip to exact window
                     mask = (df["date"] >= start_dt) & (df["date"] <= end_dt)
                     df   = df.loc[mask].reset_index(drop=True)
                     if df.empty:
@@ -280,7 +279,6 @@ def fetch_psx_prices(
                         valid.append(df)
                         log.info("[%s] ✓ %d rows", symbol, len(df))
 
-                # Polite pause between tickers
                 await asyncio.sleep(_TICKER_PAUSE)
 
         return valid, failed
@@ -290,12 +288,18 @@ def fetch_psx_prices(
     if not valid:
         raise RuntimeError("No data fetched for any ticker.")
 
+    # ── Concat all tickers ────────────────────────────────────────────────────
     result = pd.concat(valid, ignore_index=True)
     result.sort_values(["ticker", "date"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
-    log.info("Raw OHLCV shape: %s | loaded: %d | failed: %d",
-             result.shape, result["ticker"].nunique(), len(failed))
+    # ── Derive LDCP, Change, Change(%) and reorder columns ───────────────────
+    result = _derive_ldcp_change(result)
+
+    log.info(
+        "Raw shape: %s | tickers: %d | failed: %d",
+        result.shape, result["ticker"].nunique(), len(failed),
+    )
     return result, failed
 
 
@@ -308,28 +312,15 @@ def _turbulence_1d(window):
     return float(((window[-1] - mu) / sig) ** 2)
 
 
-def add_technical_indicators(df):
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Indicators computed per ticker:
+    Appends indicators to the raw DataFrame (which already contains
+    ldcp / change / change_pct).
 
-    Momentum / trend
-      macd          EMA(12) − EMA(26)
-      rsi           RSI-14
-      cci           CCI-20
-      dmi_dx        Directional Movement Index DX-14
-
-    Moving averages
-      ema_9/21/50/200
-
-    Volatility
-      bb_mid        Bollinger middle band  (SMA-20)
-      bb_upper      Bollinger upper band   (SMA-20 + 2σ)
-      bb_lower      Bollinger lower band   (SMA-20 − 2σ)
-      bb_width      (bb_upper − bb_lower) / bb_mid
-      bb_pct        %B — (close − bb_lower) / (bb_upper − bb_lower)
-
-    Risk
-      turbulence    Rolling 252-day Mahalanobis-like score
+    Momentum / trend  : macd, rsi, cci, dmi_dx
+    Moving averages   : ema_9, ema_21, ema_50, ema_200
+    Volatility        : bb_mid, bb_upper, bb_lower, bb_width, bb_pct
+    Risk              : turbulence
     """
     log.info("Computing technical indicators for %d tickers …",
              df["ticker"].nunique())
@@ -425,21 +416,30 @@ def run(cfg=None):
     log.info("raw_dir       -> %s", raw_dir)
     log.info("processed_dir -> %s", processed_dir)
 
+    # ── Step 1: fetch + derive LDCP/Change -> save raw ────────────────────────
     raw_df, failed = fetch_psx_prices(tickers, start, end)
     if failed:
         log.warning("Tickers with no data: %s", failed)
 
     raw_path = os.path.join(raw_dir, "psx_prices_raw.csv")
     raw_df.to_csv(raw_path, index=False)
-    log.info("✓ Raw OHLCV saved    -> %s  (%d rows, %.1f MB)",
-             raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
+    log.info(
+        "✓ Raw saved          -> %s  (%d rows, %.1f MB)  cols: %s",
+        raw_path, len(raw_df),
+        os.path.getsize(raw_path) / 1e6,
+        list(raw_df.columns),
+    )
 
+    # ── Step 2: add indicators -> save processed ──────────────────────────────
     processed_df   = add_technical_indicators(raw_df)
     processed_path = os.path.join(processed_dir, "psx_prices_processed.csv")
     processed_df.to_csv(processed_path, index=False)
-    log.info("✓ Processed saved    -> %s  (%d rows, %.1f MB)",
-             processed_path, len(processed_df),
-             os.path.getsize(processed_path) / 1e6)
+    log.info(
+        "✓ Processed saved    -> %s  (%d rows, %.1f MB)  cols: %s",
+        processed_path, len(processed_df),
+        os.path.getsize(processed_path) / 1e6,
+        list(processed_df.columns),
+    )
 
     return processed_df
 
