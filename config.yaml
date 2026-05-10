@@ -69,21 +69,22 @@ features:
   target_price: "close"          # used only for inverse-transform display
 
 model:
-  architecture: "lstm"           # matches build_model() check
-  type:         "lstm"           # "lstm" or "transformer"
-  seq_len:      30               # look-back window in trading days
-  lstm_hidden:  256              # increased from 128 — more capacity
-  lstm_layers:  3                # increased from 2 — deeper network
-  lstm_dropout: 0.3              # increased slightly to combat overfitting
-  tf_d_model:   64
-  tf_nhead:     4
-  tf_layers:    2
-  tf_dropout:   0.1
-  input_size:   32               # confirmed by DataLoader: X shape [64, 30, 32]
+  architecture:    "lstm"           # matches build_model() check
+  type:            "lstm"           # "lstm" or "transformer"
+  seq_len:         30               # look-back window in trading days
+  lstm_hidden:     256
+  lstm_layers:     3
+  lstm_dropout:    0.3
+  tf_d_model:      64
+  tf_nhead:        4
+  tf_layers:       2
+  tf_dropout:      0.1
+  input_size:      32               # confirmed by DataLoader: X shape [64, 30, 32]
+  checkpoints_dir: "src/models/checkpoints"   # ← added for predict.py
 
 training:
-  max_epochs:     150            # full training — no early stopping
-  epochs:         150            # legacy alias
+  max_epochs:     150
+  epochs:         150
   batch_size:     32
   lr:             0.0005
   patience:       150            # matches max_epochs — early stopping disabled
@@ -93,7 +94,7 @@ training:
   lr_factor:      0.5
   lr_patience:    5
   num_workers:    2
-  checkpoint_dir: "src/models/checkpoints"
+  checkpoint_dir: "src/models/checkpoints"   # ← kept for trainer.py
 
 news:
   finbert_model: "ProsusAI/finbert"
