@@ -47,53 +47,67 @@ data:
 
 features:
   cols:
-    - "daily_return"
-    - "log_return"
-    - "hl_range"
-    - "close_open_ratio"
-    - "volume_ratio"
-    - "rolling_vol_10"
-    - "rolling_vol_20"
-    - "price_ma5_ratio"
-    - "price_ma10_ratio"
-    - "price_ma20_ratio"
-    - "rsi"
-    - "cci"
-    - "dmi_dx"
-    - "macd_ratio"
+    - "macd_pct"
+    - "macd_sig_pct"
+    - "macd_hist_pct"
+    - "rsi_norm"
+    - "cci_norm"
+    - "di_plus_norm"
+    - "di_minus_norm"
+    - "adx_norm"
+    - "di_diff_norm"
+    - "atr_pct"
+    - "bb_pct_b"
+    - "bb_width"
+    - "obv_pct"
     - "turbulence"
+    - "close_to_high"
+    - "close_to_low"
+    - "high_low_range_pct"
+    - "gap_pct"
+    - "ret_1d"
+    - "ret_5d"
+    - "ret_10d"
+    - "ret_20d"
+    - "vol_ratio_5_20"
     - "sentiment_score"
-    - "lag1_return"
-    - "lag2_return"
-  target:       "daily_return"   # predict next-day return, not price
-  target_price: "close"          # used only for inverse-transform display
+    - "macro_pakistan_score"
+    - "psx_market_score"
+    - "energy_oil_score"
+    - "banking_finance_score"
+    - "geopolitical_global_score"
+    - "political_stability_score"
+    - "pakistani_media_score"
+    - "international_media_pakistan_score"
+  target:       "daily_return"
+  target_price: "close"
 
 model:
   architecture:    "lstm"
   type:            "lstm"
-  seq_len:         20            # reduced from 30 — faster per batch
-  lstm_hidden:     128           # reduced from 256 — faster forward pass
-  lstm_layers:     2             # reduced from 3 — faster training
+  seq_len:         20
+  lstm_hidden:     128
+  lstm_layers:     2
   lstm_dropout:    0.2
   tf_d_model:      64
   tf_nhead:        4
   tf_layers:       2
   tf_dropout:      0.1
-  input_size:      32
+  input_size:      32            # confirmed — len(FEATURE_COLS) = 32
   checkpoints_dir: "src/models/checkpoints"
 
 training:
-  max_epochs:     30             # reduced from 150 — fast per-ticker run
-  epochs:         30             # legacy alias
-  batch_size:     64             # increased from 32 — faster epoch
-  lr:             0.001          # higher lr — converges faster
+  max_epochs:     30
+  epochs:         30
+  batch_size:     64
+  lr:             0.001
   patience:       30             # matches max_epochs — no early stopping
-  seq_len:        20             # matches model.seq_len
+  seq_len:        20
   grad_clip:      1.0
   weight_decay:   0.0001
   lr_factor:      0.5
   lr_patience:    5
-  num_workers:    4              # increased — faster data loading
+  num_workers:    4
   checkpoint_dir: "src/models/checkpoints"
 
 news:
