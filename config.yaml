@@ -69,32 +69,32 @@ features:
   target_price: "close"          # used only for inverse-transform display
 
 model:
-  architecture:    "lstm"           # matches build_model() check
-  type:            "lstm"           # "lstm" or "transformer"
-  seq_len:         30               # look-back window in trading days
-  lstm_hidden:     256
-  lstm_layers:     3
-  lstm_dropout:    0.3
+  architecture:    "lstm"
+  type:            "lstm"
+  seq_len:         20            # reduced from 30 — faster per batch
+  lstm_hidden:     128           # reduced from 256 — faster forward pass
+  lstm_layers:     2             # reduced from 3 — faster training
+  lstm_dropout:    0.2
   tf_d_model:      64
   tf_nhead:        4
   tf_layers:       2
   tf_dropout:      0.1
-  input_size:      32               # confirmed by DataLoader: X shape [64, 30, 32]
-  checkpoints_dir: "src/models/checkpoints"   # ← added for predict.py
+  input_size:      32
+  checkpoints_dir: "src/models/checkpoints"
 
 training:
-  max_epochs:     150
-  epochs:         150
-  batch_size:     32
-  lr:             0.0005
-  patience:       150            # matches max_epochs — early stopping disabled
-  seq_len:        30
+  max_epochs:     30             # reduced from 150 — fast per-ticker run
+  epochs:         30             # legacy alias
+  batch_size:     64             # increased from 32 — faster epoch
+  lr:             0.001          # higher lr — converges faster
+  patience:       30             # matches max_epochs — no early stopping
+  seq_len:        20             # matches model.seq_len
   grad_clip:      1.0
   weight_decay:   0.0001
   lr_factor:      0.5
   lr_patience:    5
-  num_workers:    2
-  checkpoint_dir: "src/models/checkpoints"   # ← kept for trainer.py
+  num_workers:    4              # increased — faster data loading
+  checkpoint_dir: "src/models/checkpoints"
 
 news:
   finbert_model: "ProsusAI/finbert"
