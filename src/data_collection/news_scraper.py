@@ -18,7 +18,7 @@ Date alignment:
   - After-market news           -> forward-filled to T+1
 """
 
-import os, asyncio, logging, hashlib, warnings, importlib, subprocess, sys
+import os, asyncio, logging, hashlib, warnings, sys
 from datetime import datetime
 from urllib.parse import quote_plus
 from dateutil.relativedelta import relativedelta
@@ -42,9 +42,21 @@ log = logging.getLogger(__name__)
 
 GNEWS_RSS = "https://news.google.com/rss/search"
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)
-)))
+# ── Colab-safe PROJECT_ROOT ───────────────────────────────────────────────────
+try:
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)
+    )))
+except NameError:
+    _cwd = os.path.abspath(".")
+    PROJECT_ROOT = _cwd
+    for _candidate in [_cwd] + [os.path.join(_cwd, d) for d in os.listdir(_cwd)
+                                  if os.path.isdir(os.path.join(_cwd, d))]:
+        if os.path.isfile(os.path.join(_candidate, "config.yaml")):
+            PROJECT_ROOT = _candidate
+            break
+
+log.info("PROJECT_ROOT: %s", PROJECT_ROOT)
 
 
 def load_config(path=None):
@@ -70,12 +82,44 @@ QUERY_CATEGORIES = {
         "State Bank Pakistan interest rate",
         "Pakistani rupee PKR devaluation",
         "Pakistan foreign exchange reserves",
+        "Pakistan current account deficit surplus",
+        "Pakistan budget deficit fiscal policy",
+        "Pakistan inflation CPI SPI",
+        "Pakistan remittances workers inflow",
+        "Pakistan trade balance exports imports",
+        "Pakistan external debt repayment",
+        "Pakistan tax revenue FBR collection",
+        "Pakistan monetary policy tightening easing",
+        "Pakistan credit rating Moody Fitch",
+        "Pakistan economic reform privatisation",
+        "Pakistan FATF grey list compliance",
+        "Pakistan circular debt energy sector",
+        "Pakistan poverty unemployment economy",
+        "Pakistan agriculture crop wheat cotton",
+        "Pakistan manufacturing LSM industrial output",
     ],
 
     "psx_market": [
         "PSX Pakistan Stock Exchange KSE100",
         "KSE100 index bullish bearish",
         "PSX company earnings results",
+        "Pakistan stock market rally sell-off",
+        "KSE100 record high low points",
+        "PSX foreign investor outflow inflow",
+        "Pakistan stock exchange listing IPO",
+        "PSX circuit breaker trading halt",
+        "KSE100 market capitalization",
+        "PSX brokerage TREC regulations",
+        "Pakistan equity market outlook",
+        "KSE100 dividend yield returns",
+        "PSX SECP regulations compliance",
+        "Pakistan stock market correction crash",
+        "KSE AllShare index performance",
+        "PSX trading volume turnover",
+        "Pakistan mutual fund AUM flows",
+        "PSX index rebalancing constituents",
+        "Pakistan capital market development",
+        "SECP Pakistan securities policy",
     ],
 
     "energy_oil": [
@@ -83,11 +127,45 @@ QUERY_CATEGORIES = {
         "crude oil OPEC Pakistan impact",
         "Pakistan LNG energy crisis",
         "Pakistan petroleum fuel price",
+        "Pakistan electricity tariff hike",
+        "Pakistan power sector NEPRA",
+        "Pakistan gas shortage winter",
+        "Pakistan refinery expansion upgrade",
+        "Pakistan renewable solar wind energy",
+        "Pakistan nuclear power plant",
+        "Pakistan petroleum levy fuel subsidy",
+        "Pakistan energy mix coal furnace oil",
+        "OGDC PPL exploration discovery",
+        "Pakistan offshore oil gas exploration",
+        "Pakistan pipeline gas import",
+        "Pakistan petrol diesel price change",
+        "Pakistan RLNG terminal import",
+        "Pakistan IPP independent power producer",
+        "Pakistan electricity load shedding",
+        "Pakistan energy transition climate",
     ],
 
     "banking_finance": [
         "HBL MCB UBL Pakistan bank earnings",
         "Pakistan banking NPL loans",
+        "Pakistan bank profit interest income",
+        "State Bank Pakistan SBP policy rate",
+        "Pakistan microfinance digital banking",
+        "Pakistan banking sector CAR capital",
+        "HBL Habib Bank international expansion",
+        "MCB Bank profit dividend",
+        "UBL United Bank earnings result",
+        "Allied Bank ABL quarterly results",
+        "Bank Alfalah BAFL performance",
+        "Meezan Bank Islamic finance growth",
+        "Pakistan fintech digital payments",
+        "Pakistan banking NPL provisioning",
+        "Pakistan credit growth private sector",
+        "Pakistan T-bill PIB yields auction",
+        "Pakistan banking sector merger acquisition",
+        "NBP National Bank Pakistan results",
+        "Pakistan insurance sector takaful",
+        "Pakistan mortgage housing finance",
     ],
 
     "geopolitical_global": [
@@ -97,12 +175,120 @@ QUERY_CATEGORIES = {
         "US Federal Reserve emerging markets",
         "Russia Ukraine commodity Pakistan",
         "Pakistan Saudi Arabia UAE investment",
+        "Pakistan Afghanistan border trade",
+        "Pakistan Turkey bilateral trade",
+        "Pakistan US relations sanctions",
+        "China Pakistan economic corridor update",
+        "Pakistan Gulf remittances workers",
+        "Pakistan Asia emerging market capital",
+        "Global commodity prices Pakistan impact",
+        "Pakistan dollar shortage forex crisis",
+        "Pakistan regional connectivity trade",
+        "Pakistan Iran border trade sanctions",
+        "Pakistan SCO Shanghai Cooperation",
+        "Pakistan IMF World Bank ADB loans",
+        "Pakistan Belt Road Initiative BRI",
+        "Pakistan diaspora investment bonds",
     ],
 
     "political_stability": [
         "Pakistan political crisis government",
         "Pakistan elections economy",
         "Pakistan Prime Minister policy",
+        "Pakistan army military political",
+        "Pakistan Supreme Court ruling economy",
+        "Pakistan PTI PDM government policy",
+        "Pakistan coalition government stability",
+        "Pakistan protest strike business impact",
+        "Pakistan martial law constitutional crisis",
+        "Pakistan general election result",
+        "Pakistan cabinet reshuffle minister",
+        "Pakistan parliament budget approval",
+        "Pakistan provincial government KPK Punjab Sindh",
+        "Pakistan political uncertainty investor",
+        "Pakistan governance reform accountability",
+        "Pakistan NAB corruption case business",
+        "Pakistan Senate National Assembly legislation",
+        "Pakistan political party economic agenda",
+        "Pakistan civil military relations",
+        "Pakistan policy continuity investor confidence",
+    ],
+
+    "pakistani_media": [
+        "Dawn News Pakistan economy stock",
+        "Geo News Pakistan business finance",
+        "ARY News Pakistan economy market",
+        "The News International Pakistan stocks",
+        "Express Tribune Pakistan economy PSX",
+        "Business Recorder Pakistan KSE market",
+        "Pakistan Observer economy inflation",
+        "Daily Pakistan economy rupee",
+        "Samaa News Pakistan economic crisis",
+        "Dunya News Pakistan economy budget",
+        "Profit Pakistan business finance",
+        "Pakistan Today market economy",
+        "Tribune Express Pakistan business",
+        "Dawn Business Pakistan corporate results",
+        "Geo Business Pakistan finance news",
+    ],
+
+    "international_media_pakistan": [
+        "Reuters Pakistan economy market",
+        "Bloomberg Pakistan stocks rupee",
+        "Financial Times Pakistan economy",
+        "Wall Street Journal Pakistan",
+        "Al Jazeera Pakistan economy crisis",
+        "BBC Pakistan economy inflation",
+        "CNBC Pakistan emerging market",
+        "The Economist Pakistan economy",
+        "Associated Press Pakistan finance",
+        "South China Morning Post Pakistan CPEC",
+        "Nikkei Asia Pakistan economy",
+        "Gulf News Pakistan economy remittances",
+        "Arab News Pakistan trade investment",
+        "Middle East Eye Pakistan economy",
+        "AFP Pakistan economy stock market",
+    ],
+
+    "psx_official_corporate": [
+        "PSX official announcement Pakistan Exchange",
+        "SECP Securities Exchange Commission Pakistan order",
+        "Pakistan stock exchange new listing",
+        "PSX corporate disclosure financial results",
+        "Pakistan company quarterly annual results",
+        "PSX dividend announcement Pakistan",
+        "Pakistan company rights issue bonus",
+        "SECP enforcement action Pakistan company",
+        "PSX trading rules regulations update",
+        "Pakistan company merger acquisition PSX",
+        "PSX index methodology change",
+        "Pakistan Exchange Traded Fund ETF",
+        "PSX market maker liquidity provider",
+        "Pakistan company AGM EGM announcement",
+        "SECP prospectus IPO approval Pakistan",
+        "PSX corporate governance compliance",
+        "Pakistan privatisation divestment PSX",
+        "PSX settlement clearing NCCPL",
+        "Pakistan company sukuk bond issue",
+        "SECP mutual fund regulations Pakistan",
+    ],
+
+    "sector_specific": [
+        "Pakistan cement sector demand prices LUCK DGKC",
+        "Pakistan fertiliser sector ENGRO FFBL FATIMA",
+        "Pakistan textile sector exports quota",
+        "Pakistan auto sector PSMC INDU sales",
+        "Pakistan pharma sector SEARL HINOON results",
+        "Pakistan telecom PTCL Jazz Telenor",
+        "Pakistan steel sector ISL ASTL demand",
+        "Pakistan sugar sector mill crushing",
+        "Pakistan chemicals sector ICI Lotte",
+        "Pakistan food sector NESTLE UNILEVER FFL",
+        "Pakistan real estate property DHA",
+        "Pakistan technology IT exports software",
+        "Pakistan media PEMRA broadcast advertising",
+        "Pakistan tobacco PMI PAKT results",
+        "Pakistan glass packaging Ghani AGC",
     ],
 }
 
@@ -136,14 +322,13 @@ async def _fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk)
     before = job["before"]
     cat    = job["category"]
     url = (
-      f"{GNEWS_RSS}?q={quote_plus(f'{q} after:{after} before:{before}')}"
-      f"&hl=en-US&gl=PK&ceid=PK:en"
+        f"{GNEWS_RSS}?q={quote_plus(f'{q} after:{after} before:{before}')}"
+        f"&hl=en-US&gl=PK&ceid=PK:en"
     )
     async with semaphore:
         try:
             async with session.get(
                 url,
-                timeout=aiohttp.ClientTimeout(total=15),
                 headers={"User-Agent": "Mozilla/5.0"},
             ) as resp:
                 content = await resp.read()
@@ -173,36 +358,61 @@ async def _run_all_jobs(jobs, max_per_chunk, concurrency):
     seen_hash = set()
     results   = []
     semaphore = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    connector = aiohttp.TCPConnector(
+        limit                 = concurrency,
+        ttl_dns_cache         = 300,
+        enable_cleanup_closed = True,
+    )
+    timeout = aiohttp.ClientTimeout(total=10, connect=5)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         tasks = [
-            _fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk)
+            asyncio.ensure_future(
+                _fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk)
+            )
             for job in jobs
         ]
         for coro in tqdm(
             asyncio.as_completed(tasks),
             total=len(tasks),
             desc="Fetching RSS",
+            unit="req",
+            ncols=80,
         ):
             await coro
     return results
 
 
-def collect_all_articles(start, end, chunk_months, max_per_chunk, concurrency=20):
+def collect_all_articles(start, end, chunk_months, max_per_chunk, concurrency=50):
     jobs = _build_jobs(start, end, chunk_months)
+    total_queries = sum(len(v) for v in QUERY_CATEGORIES.values())
     log.info(
-        "Starting async collection: %d categories, %d total RSS jobs",
-        len(QUERY_CATEGORIES), len(jobs),
+        "Jobs: %d categories | %d queries | %d RSS requests",
+        len(QUERY_CATEGORIES), total_queries, len(jobs),
     )
+
     nest_asyncio.apply()
-    results = asyncio.run(_run_all_jobs(jobs, max_per_chunk, concurrency))
-    df = pd.DataFrame(
-        results,
-        columns=["date", "hour", "title", "category", "source", "url"],
-    )
+
+    async def _run():
+        return await _run_all_jobs(jobs, max_per_chunk, concurrency)
+
+    try:
+        asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
+        results = loop.run_until_complete(_run())
+    except RuntimeError:
+        results = asyncio.run(_run())
+
+    if not results:
+        log.warning("No articles collected — check internet / Google News access")
+        return pd.DataFrame(columns=["date", "hour", "title", "category", "source", "url"])
+
+    df = pd.DataFrame(results)
     df["date"] = pd.to_datetime(df["date"])
     df.sort_values("date", inplace=True)
-    log.info("Total unique articles collected: %d", len(df))
+    log.info(
+        "\u2713 Unique articles collected: %d  (from %d requests)",
+        len(df), len(jobs),
+    )
     return df.reset_index(drop=True)
 
 
@@ -277,22 +487,20 @@ def align_to_trading_days(df, trading_dates):
     trading_dates = pd.DatetimeIndex(sorted(trading_dates))
 
     def _map_date(row):
-        d    = pd.Timestamp(row["date"]).normalize()   # strip time, ensure Timestamp
+        d    = pd.Timestamp(row["date"]).normalize()
         hour = row["hour"]
 
-        # After-market (>= 11am PST cutoff) → push to next trading day
         if d in trading_dates and hour >= 11:
             idx = trading_dates.get_loc(d)
             if idx + 1 < len(trading_dates):
-                return trading_dates[idx + 1]   # already a scalar Timestamp
+                return trading_dates[idx + 1]
 
-        # Forward-fill to next available trading day
         future = trading_dates[trading_dates >= d]
-        return future[0] if len(future) > 0 else d    # future[0] is a scalar
+        return future[0] if len(future) > 0 else d
 
     log.info("Aligning %d articles to trading days ...", len(df))
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()   # ensure clean dates
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df["trading_date"] = df.apply(_map_date, axis=1)
     return df
 
@@ -342,7 +550,6 @@ def aggregate_daily_sentiment(df, start, end, trading_dates):
     return daily.reset_index()
 
 
-
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None):
@@ -364,14 +571,14 @@ def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None)
     articles_df = collect_all_articles(
         start         = start,
         end           = end,
-        chunk_months  = news_cfg["chunk_months"],
-        max_per_chunk = news_cfg["max_per_chunk"],
-        concurrency   = news_cfg.get("concurrency", 20),
+        chunk_months  = news_cfg.get("chunk_months", 3),
+        max_per_chunk = news_cfg.get("max_per_chunk", 5),
+        concurrency   = news_cfg.get("concurrency", 50),
     )
 
     raw_articles_path = os.path.join(raw_news_dir, "articles_raw.csv")
     articles_df.to_csv(raw_articles_path, index=False)
-    log.info("✓ Raw articles saved  -> %s  (%d rows)", raw_articles_path, len(articles_df))
+    log.info("\u2713 Raw articles saved  -> %s  (%d rows)", raw_articles_path, len(articles_df))
 
     scorer   = FinBERTScorer(model_name=news_cfg["finbert_model"])
     score_df = scorer.score(articles_df["title"].tolist())
@@ -381,7 +588,7 @@ def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None)
 
     scored_path = os.path.join(processed_dir, "articles_scored.csv")
     articles_df.to_csv(scored_path, index=False)
-    log.info("✓ Scored articles saved -> %s  (%d rows)", scored_path, len(articles_df))
+    log.info("\u2713 Scored articles saved -> %s  (%d rows)", scored_path, len(articles_df))
 
     if trading_dates is None:
         trading_dates = pd.date_range(start=start, end=end, freq="B")
@@ -394,7 +601,7 @@ def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None)
     if not os.path.exists(processed_path):
         raise RuntimeError(f"Processed sentiment file NOT saved -> {processed_path}")
     log.info(
-        "✓ Daily sentiment saved -> %s  (%d rows, %.1f MB)",
+        "\u2713 Daily sentiment saved -> %s  (%d rows, %.1f MB)",
         processed_path, len(sentiment_daily),
         os.path.getsize(processed_path) / 1e6,
     )
@@ -402,5 +609,6 @@ def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None)
     return sentiment_daily
 
 
+# ── Colab-safe entry guard ────────────────────────────────────────────────────
 if __name__ == "__main__":
     run()
