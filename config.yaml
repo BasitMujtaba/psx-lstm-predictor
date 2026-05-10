@@ -112,12 +112,12 @@ model:
   type:            "lstm"
   seq_len:         60
   input_size:      47
-  lstm_hidden:     256
-  lstm_layers:     4
+  lstm_hidden:     128
+  lstm_layers:     2
   lstm_dropout:    0.3
   num_heads:       8
   cross_heads:     4
-  fc_hidden:       256
+  fc_hidden:       128
   use_ensemble:    true
   xgb_trees:       1000
   xgb_depth:       6
