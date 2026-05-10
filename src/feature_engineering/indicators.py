@@ -1,29 +1,25 @@
 """
 src/feature_engineering/indicators.py
 ========================================
-Computes technical indicators for PSX OHLCV data.
+Computes scale-free technical indicators for PSX LSTM pipeline.
 
-All functions accept a per-ticker DataFrame with columns:
-    open, high, low, close, volume  (case-insensitive)
-and return the same DataFrame with new indicator columns appended.
+Input
+-----
+  Per-ticker DataFrame from psx_downloader with columns:
+    date, ticker, ldcp, open, high, low, close,
+    change, change_pct, volume
 
-Why scale-free?
-  Close prices differ wildly across tickers (OGDC ~100 PKR, LUCK ~800 PKR).
-  Using raw prices would force the scaler to treat them differently.
-  Every indicator here is either:
-    (a) a ratio / percentage  -> dimensionless
-    (b) a bounded oscillator  -> already in [0, 100] or similar
-
-Indicators implemented
-----------------------
-  1. MACD          - momentum (% of price)
-  2. RSI           - momentum oscillator [0, 100]
-  3. CCI           - commodity channel index
-  4. DMI / ADX     - trend strength + direction
-  5. ATR %         - volatility relative to price
-  6. Bollinger %B  - price position within bands
-  7. OBV Change %  - volume-weighted momentum
-  8. Turbulence    - Mahalanobis distance (market stress)
+Indicators produced
+-------------------
+  MACD        macd_pct, macd_sig_pct, macd_hist_pct     (% of close)
+  RSI         rsi_norm                                   [0, 1]
+  CCI         cci_norm                                   [-1, +1]
+  DMI / ADX   di_plus_norm, di_minus_norm,
+              adx_norm, di_diff_norm                     [0,1] / [-1,+1]
+  ATR %       atr_pct                                    (% of close)
+  Bollinger   bb_pct_b, bb_width                         [0,1] / ratio
+  OBV         obv_pct                                    (% change)
+  Turbulence  turbulence                                 (Mahalanobis)
 """
 
 import logging
@@ -33,24 +29,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
-def _normalise_cols(df):
-    """
-    Lower-case all column names and flatten yfinance MultiIndex columns.
-    New yfinance returns MultiIndex like ("Close", "OGDC.KA").
-    This flattens them to plain lowercase strings so the rest of the
-    pipeline works without any special-casing.
-    """
-    df = df.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].lower() for c in df.columns]
-    else:
-        df.columns = [c.lower() for c in df.columns]
-    return df
-
+# ── Guards ────────────────────────────────────────────────────────────────────
 
 def _check_cols(df, required):
     missing = [c for c in required if c not in df.columns]
@@ -58,17 +37,9 @@ def _check_cols(df, required):
         raise ValueError(f"DataFrame missing columns: {missing}")
 
 
-# =============================================================================
-# 1.  MACD  (normalised as % of close price)
-# =============================================================================
+# ── 1. MACD (normalised as % of close) ───────────────────────────────────────
 
 def add_macd(df, fast=12, slow=26, signal=9):
-    """
-    MACD line   = EMA(fast) - EMA(slow)
-    Signal line = EMA(MACD, signal)
-    Histogram   = MACD - Signal
-    All three divided by close -> price-agnostic.
-    """
     _check_cols(df, ["close"])
     c        = df["close"]
     ema_fast = c.ewm(span=fast,   adjust=False).mean()
@@ -84,16 +55,9 @@ def add_macd(df, fast=12, slow=26, signal=9):
     return df
 
 
-# =============================================================================
-# 2.  RSI  [0, 100]  ->  normalised to [0, 1]
-# =============================================================================
+# ── 2. RSI -> normalised to [0, 1] ───────────────────────────────────────────
 
 def add_rsi(df, period=14):
-    """
-    Wilders RSI.
-    rsi      : raw value in [0, 100]
-    rsi_norm : scaled to [0, 1] to match the range of other features
-    """
     _check_cols(df, ["close"])
     delta    = df["close"].diff()
     gain     = delta.clip(lower=0)
@@ -104,20 +68,13 @@ def add_rsi(df, period=14):
     rsi      = 100 - (100 / (1 + rs))
 
     df = df.copy()
-    df["rsi"]      = rsi
     df["rsi_norm"] = rsi / 100
     return df
 
 
-# =============================================================================
-# 3.  CCI  (Commodity Channel Index)
-# =============================================================================
+# ── 3. CCI -> clipped [-1, +1] ───────────────────────────────────────────────
 
 def add_cci(df, period=20):
-    """
-    CCI = (Typical Price - SMA) / (0.015 * Mean Deviation)
-    Clipped at +-300 then / 300 -> soft [-1, +1] range.
-    """
     _check_cols(df, ["high", "low", "close"])
     tp  = (df["high"] + df["low"] + df["close"]) / 3
     sma = tp.rolling(period).mean()
@@ -127,24 +84,18 @@ def add_cci(df, period=20):
     cci = (tp - sma) / (0.015 * mad.replace(0, np.nan))
 
     df = df.copy()
-    df["cci"]      = cci
     df["cci_norm"] = cci.clip(-300, 300) / 300
     return df
 
 
-# =============================================================================
-# 4.  DMI  +  ADX  (Directional Movement Index)
-# =============================================================================
+# ── 4. DMI / ADX ─────────────────────────────────────────────────────────────
 
 def add_dmi(df, period=14):
     """
-    +DM, -DM -> smoothed with Wilders EMA -> +DI, -DI in [0, 100]
-    ADX       = Wilders EMA of DX
-
-    di_plus_norm   - bullish directional strength   [0, 1]
-    di_minus_norm  - bearish directional strength   [0, 1]
-    adx_norm       - overall trend strength         [0, 1]
-    di_diff_norm   - (+DI - -DI) / 100             [-1, +1]
+    di_plus_norm   [0, 1]   bullish directional strength
+    di_minus_norm  [0, 1]   bearish directional strength
+    adx_norm       [0, 1]   overall trend strength  (divided by 100)
+    di_diff_norm   [-1, +1] (+DI - -DI) / 100
     """
     _check_cols(df, ["high", "low", "close"])
     h  = df["high"]
@@ -160,7 +111,7 @@ def add_dmi(df, period=14):
     move_up   = h - h.shift(1)
     move_down = l.shift(1) - l
 
-    dm_plus  = move_up.where((move_up > move_down) & (move_up > 0), 0.0)
+    dm_plus  = move_up.where((move_up > move_down)   & (move_up > 0),   0.0)
     dm_minus = move_down.where((move_down > move_up) & (move_down > 0), 0.0)
 
     def _wilder(series, n):
@@ -173,12 +124,12 @@ def add_dmi(df, period=14):
             )
         return result
 
-    tr_smooth   = _wilder(tr,       period)
-    dm_plus_sm  = _wilder(dm_plus,  period)
-    dm_minus_sm = _wilder(dm_minus, period)
+    tr_s   = _wilder(tr,       period)
+    dmp_s  = _wilder(dm_plus,  period)
+    dmm_s  = _wilder(dm_minus, period)
 
-    di_plus  = 100 * dm_plus_sm  / tr_smooth.replace(0, np.nan)
-    di_minus = 100 * dm_minus_sm / tr_smooth.replace(0, np.nan)
+    di_plus  = 100 * dmp_s  / tr_s.replace(0, np.nan)
+    di_minus = 100 * dmm_s  / tr_s.replace(0, np.nan)
     dx       = (100 * (di_plus - di_minus).abs()
                 / (di_plus + di_minus).replace(0, np.nan))
     adx      = _wilder(dx, period)
@@ -186,23 +137,17 @@ def add_dmi(df, period=14):
     df = df.copy()
     df["di_plus_norm"]  = di_plus  / 100
     df["di_minus_norm"] = di_minus / 100
-    df["adx_norm"]      = adx      / 100
+    df["adx_norm"]      = adx      / 100   # fixed: was missing /100, raw ADX leaked into features
     df["di_diff_norm"]  = (di_plus - di_minus).clip(-100, 100) / 100
     return df
 
 
-# =============================================================================
-# 5.  ATR %  (Average True Range as % of close)
-# =============================================================================
+# ── 5. ATR % ─────────────────────────────────────────────────────────────────
 
 def add_atr(df, period=14):
-    """
-    ATR / close -> dimensionless volatility.
-    Typical PSX values: 0.01 - 0.04  (1-4% daily range).
-    """
     _check_cols(df, ["high", "low", "close"])
-    pc = df["close"].shift(1)
-    tr = pd.concat([
+    pc  = df["close"].shift(1)
+    tr  = pd.concat([
         df["high"] - df["low"],
         (df["high"] - pc).abs(),
         (df["low"]  - pc).abs(),
@@ -214,15 +159,9 @@ def add_atr(df, period=14):
     return df
 
 
-# =============================================================================
-# 6.  Bollinger Bands  - %B and bandwidth
-# =============================================================================
+# ── 6. Bollinger Bands ────────────────────────────────────────────────────────
 
 def add_bollinger(df, period=20, num_std=2.0):
-    """
-    bb_pct_b  = (close - lower) / (upper - lower)  -> 0 to 1 inside bands
-    bb_width  = (upper - lower) / middle            -> dimensionless width
-    """
     _check_cols(df, ["close"])
     mid   = df["close"].rolling(period).mean()
     std   = df["close"].rolling(period).std()
@@ -235,14 +174,9 @@ def add_bollinger(df, period=20, num_std=2.0):
     return df
 
 
-# =============================================================================
-# 7.  OBV Change %  (On-Balance Volume momentum)
-# =============================================================================
+# ── 7. OBV % change ───────────────────────────────────────────────────────────
 
 def add_obv(df, period=14):
-    """
-    OBV % change over N days -> scale-free regardless of float size.
-    """
     _check_cols(df, ["close", "volume"])
     direction = np.sign(df["close"].diff())
     obv       = (direction * df["volume"]).fillna(0).cumsum()
@@ -253,22 +187,9 @@ def add_obv(df, period=14):
     return df
 
 
-# =============================================================================
-# 8.  Turbulence Index  (Mahalanobis distance from historical mean)
-# =============================================================================
+# ── 8. Turbulence (Mahalanobis distance) ─────────────────────────────────────
 
 def add_turbulence(df, lookback=252, min_periods=60):
-    """
-    Turbulence_t = (r_t - mu) @ cov_inv @ (r_t - mu).T
-
-    r_t  = log-return vector [close_return, volume_return]
-    mu   = rolling mean over lookback window
-    cov  = rolling covariance over lookback window
-
-    High value -> market behaving unlike its recent history
-    (crash, regime change, geopolitical shock).
-    Raw score returned; normalisation handled by scaler.py.
-    """
     _check_cols(df, ["close", "volume"])
 
     log_ret_close  = np.log(df["close"] / df["close"].shift(1))
@@ -303,16 +224,17 @@ def add_turbulence(df, lookback=252, min_periods=60):
     return df
 
 
-# =============================================================================
-# Master function  -  apply all indicators in one call
-# =============================================================================
+# ── Master function ───────────────────────────────────────────────────────────
 
 def add_all_indicators(df, cfg=None):
     """
-    Applies every indicator to a single-ticker OHLCV DataFrame.
-    Handles yfinance MultiIndex columns automatically.
+    Applies all scale-free indicators to a single-ticker DataFrame.
 
-    config.yaml section:
+    Input columns required:
+        date, open, high, low, close, volume
+        (ldcp, change, change_pct, ticker also accepted and passed through)
+
+    config.yaml section (all optional — defaults shown):
         indicators:
           macd_fast:               12
           macd_slow:               26
@@ -327,75 +249,33 @@ def add_all_indicators(df, cfg=None):
           turbulence_lookback:    252
           turbulence_min_periods:  60
     """
-    p  = (cfg or {}).get("indicators", {})
-    df = _normalise_cols(df)
+    p = (cfg or {}).get("indicators", {})
 
-    log.debug("Adding MACD ...")
-    df = add_macd(df, fast=p.get("macd_fast", 12),
+    df = add_macd(df,
+                  fast=p.get("macd_fast", 12),
                   slow=p.get("macd_slow", 26),
                   signal=p.get("macd_signal", 9))
-
-    log.debug("Adding RSI ...")
-    df = add_rsi(df, period=p.get("rsi_period", 14))
-
-    log.debug("Adding CCI ...")
-    df = add_cci(df, period=p.get("cci_period", 20))
-
-    log.debug("Adding DMI / ADX ...")
-    df = add_dmi(df, period=p.get("dmi_period", 14))
-
-    log.debug("Adding ATR ...")
-    df = add_atr(df, period=p.get("atr_period", 14))
-
-    log.debug("Adding Bollinger Bands ...")
-    df = add_bollinger(df, period=p.get("bb_period", 20),
+    df = add_rsi(df,       period=p.get("rsi_period", 14))
+    df = add_cci(df,       period=p.get("cci_period", 20))
+    df = add_dmi(df,       period=p.get("dmi_period", 14))
+    df = add_atr(df,       period=p.get("atr_period", 14))
+    df = add_bollinger(df,
+                       period=p.get("bb_period", 20),
                        num_std=p.get("bb_std", 2.0))
-
-    log.debug("Adding OBV ...")
-    df = add_obv(df, period=p.get("obv_period", 14))
-
-    log.debug("Adding Turbulence ...")
-    df = add_turbulence(df, lookback=p.get("turbulence_lookback", 252),
+    df = add_obv(df,       period=p.get("obv_period", 14))
+    df = add_turbulence(df,
+                        lookback=p.get("turbulence_lookback", 252),
                         min_periods=p.get("turbulence_min_periods", 60))
 
-    base_cols      = {"open", "high", "low", "close", "volume"}
-    indicator_cols = [c for c in df.columns if c not in base_cols]
-    before         = len(df)
-    df             = df.dropna(subset=indicator_cols)
+    indicator_cols = [
+        "macd_pct", "macd_sig_pct", "macd_hist_pct",
+        "rsi_norm", "cci_norm",
+        "di_plus_norm", "di_minus_norm", "adx_norm", "di_diff_norm",
+        "atr_pct", "bb_pct_b", "bb_width", "obv_pct", "turbulence",
+    ]
+    before = len(df)
+    df     = df.dropna(subset=indicator_cols)
     log.info("Warm-up rows dropped: %d -> %d (removed %d)",
              before, len(df), before - len(df))
 
     return df.reset_index(drop=True)
-
-
-# =============================================================================
-# Smoke-test
-# =============================================================================
-
-if __name__ == "__main__":
-    import yfinance as yf
-    logging.basicConfig(level=logging.DEBUG,
-                        format="%(asctime)s  %(levelname)s  %(message)s")
-
-    log.info("Smoke test: downloading OGDC.KA ...")
-    raw = yf.download("OGDC.KA", start="2020-01-01", end="2024-12-31",
-                      auto_adjust=True, progress=False)
-
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = [c[0].lower() for c in raw.columns]
-    else:
-        raw.columns = [c.lower() for c in raw.columns]
-
-    raw    = raw[["open", "high", "low", "close", "volume"]].dropna()
-    result = add_all_indicators(raw)
-
-    print("\n--- Last 5 rows ---")
-    print(result.tail(5).to_string())
-
-    print("\n--- Feature summary ---")
-    base = {"open", "high", "low", "close", "volume"}
-    for col in result.columns:
-        if col not in base:
-            print(f"  {col:25s}  min={result[col].min():+.4f}"
-                  f"  max={result[col].max():+.4f}"
-                  f"  nulls={result[col].isna().sum()}")
