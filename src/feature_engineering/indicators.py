@@ -94,8 +94,13 @@ def add_dmi(df, period=14):
     """
     di_plus_norm   [0, 1]   bullish directional strength
     di_minus_norm  [0, 1]   bearish directional strength
-    adx_norm       [0, 1]   overall trend strength  (divided by 100)
+    adx_norm       [0, 1]   trend strength  (rolling mean of DX / 100)
     di_diff_norm   [-1, +1] (+DI - -DI) / 100
+
+    Note: ADX uses rolling mean of DX (not Wilder smoothing).
+    Wilder smoothing accumulates on an already-bounded 0-100 DX series
+    and blows up to 300-900 range — confirmed in testing.
+    Rolling mean keeps ADX correctly in [0, 100] before /100 normalisation.
     """
     _check_cols(df, ["high", "low", "close"])
     h  = df["high"]
@@ -128,16 +133,18 @@ def add_dmi(df, period=14):
     dmp_s  = _wilder(dm_plus,  period)
     dmm_s  = _wilder(dm_minus, period)
 
-    di_plus  = 100 * dmp_s  / tr_s.replace(0, np.nan)
-    di_minus = 100 * dmm_s  / tr_s.replace(0, np.nan)
+    di_plus  = 100 * dmp_s / tr_s.replace(0, np.nan)
+    di_minus = 100 * dmm_s / tr_s.replace(0, np.nan)
     dx       = (100 * (di_plus - di_minus).abs()
                 / (di_plus + di_minus).replace(0, np.nan))
-    adx      = _wilder(dx, period)
+
+    # fixed: use rolling mean for ADX — Wilder smoothing explodes DX to 300-900
+    adx = dx.rolling(period).mean()
 
     df = df.copy()
     df["di_plus_norm"]  = di_plus  / 100
     df["di_minus_norm"] = di_minus / 100
-    df["adx_norm"]      = adx      / 100   # fixed: was missing /100, raw ADX leaked into features
+    df["adx_norm"]      = adx      / 100
     df["di_diff_norm"]  = (di_plus - di_minus).clip(-100, 100) / 100
     return df
 
