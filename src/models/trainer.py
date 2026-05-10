@@ -32,8 +32,8 @@ Saved artefacts
 config.yaml section used
 ------------------------
   training:
-    max_epochs:    100
-    patience:      15
+    max_epochs:    50
+    patience:      8
     lr:            0.001
     weight_decay:  0.0001
     lr_factor:     0.5
@@ -46,7 +46,6 @@ config.yaml section used
 
 import os
 import logging
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
@@ -157,14 +156,14 @@ def train(model, train_loader, val_loader,
     -------
     history : dict with lists  "train_loss", "val_loss", "lr"
     """
-    t_cfg       = cfg.get("training", {})
-    max_epochs  = t_cfg.get("max_epochs",   100)
-    patience    = t_cfg.get("patience",      15)
-    lr          = t_cfg.get("lr",          1e-3)
-    weight_decay= t_cfg.get("weight_decay", 1e-4)
-    lr_factor   = t_cfg.get("lr_factor",    0.5)
-    lr_patience = t_cfg.get("lr_patience",    7)
-    grad_clip   = t_cfg.get("grad_clip",    1.0)
+    t_cfg        = cfg.get("training", {})
+    max_epochs   = t_cfg.get("max_epochs",   50)
+    patience     = t_cfg.get("patience",      8)
+    lr           = t_cfg.get("lr",          1e-3)
+    weight_decay = t_cfg.get("weight_decay", 1e-4)
+    lr_factor    = t_cfg.get("lr_factor",    0.5)
+    lr_patience  = t_cfg.get("lr_patience",    7)
+    grad_clip    = t_cfg.get("grad_clip",    1.0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Training on: %s", device)
@@ -176,11 +175,10 @@ def train(model, train_loader, val_loader,
         optimiser, mode="min",
         factor   = lr_factor,
         patience = lr_patience,
-        verbose  = False,
     )
 
-    history   = {"train_loss": [], "val_loss": [], "lr": []}
-    best_val  = float("inf")
+    history    = {"train_loss": [], "val_loss": [], "lr": []}
+    best_val   = float("inf")
     no_improve = 0
 
     for epoch in range(1, max_epochs + 1):
@@ -265,7 +263,6 @@ def run(scaled_dict, feature_cols, target_col,
         log.info("Training ticker: %s", ticker)
         log.info("=" * 60)
 
-        # Per-ticker loaders (single-ticker, not pooled)
         single_dict = {ticker: splits}
         train_loader, val_loader, _ = make_loaders(
             single_dict, feature_cols, target_col,
@@ -292,84 +289,3 @@ def run(scaled_dict, feature_cols, target_col,
 
     log.info("All tickers trained.")
     return history_dict
-
-
-# =============================================================================
-# Smoke-test
-# =============================================================================
-
-if __name__ == "__main__":
-    import yfinance as yf
-    import pandas as pd
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
-    from src.feature_engineering.indicators import add_all_indicators
-    from src.feature_engineering.features   import (
-        build_features, FEATURE_COLS, TARGET_COL,
-    )
-    from src.models.scaler  import scale_ticker
-    from src.models.lstm    import build_model
-    from src.models.dataset import make_loaders
-
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s  %(levelname)s  %(message)s")
-
-    raw = yf.download("OGDC.KA", start="2020-01-01", end="2024-12-31",
-                      auto_adjust=True, progress=False)
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = [c[0].lower() for c in raw.columns]
-    else:
-        raw.columns = [c.lower() for c in raw.columns]
-    raw = raw[["open", "high", "low", "close", "volume"]].dropna()
-    raw = raw.reset_index().rename(columns={"Date": "date", "index": "date"})
-    raw["date"] = pd.to_datetime(raw["date"])
-
-    df_feat = build_features(add_all_indicators(raw), sentiment_df=None)
-    train_s, val_s, test_s, feat_sc, tgt_sc = scale_ticker(
-        df_feat, FEATURE_COLS, TARGET_COL
-    )
-
-    cfg = {
-        "model": {
-            "architecture": "lstm",
-            "input_size":   len(FEATURE_COLS),
-        },
-        "training": {
-            "max_epochs":  5,
-            "patience":    3,
-            "lr":          1e-3,
-            "weight_decay":1e-4,
-            "lr_factor":   0.5,
-            "lr_patience": 2,
-            "grad_clip":   1.0,
-            "batch_size":  32,
-            "seq_len":     30,
-            "num_workers": 0,
-        },
-    }
-
-    scaled_dict  = {"OGDC.KA": (train_s, val_s, test_s)}
-    train_loader, val_loader, _ = make_loaders(
-        scaled_dict, FEATURE_COLS, TARGET_COL,
-        seq_len=30, batch_size=32, num_workers=0, pin_memory=False,
-    )
-
-    model = build_model(cfg)
-    history = train(
-        model        = model,
-        train_loader = train_loader,
-        val_loader   = val_loader,
-        cfg          = cfg,
-        ckpt_path    = "/tmp/OGDC_best.pt",
-        feature_cols = FEATURE_COLS,
-        target_col   = TARGET_COL,
-    )
-
-    print("\nTraining history (last 3 epochs):")
-    for i in range(-3, 0):
-        print(f"  epoch {len(history['train_loss'])+i+1:3d}  "
-              f"train={history['train_loss'][i]:.6f}  "
-              f"val={history['val_loss'][i]:.6f}")
-
-    print("\n✓ trainer.py smoke-test passed.")
