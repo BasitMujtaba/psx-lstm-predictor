@@ -82,17 +82,17 @@ model:
   input_size:   32               # confirmed by DataLoader: X shape [64, 30, 32]
 
 training:
-  max_epochs:     150            # increased from 50 — more room to converge
+  max_epochs:     150            # full training — no early stopping
   epochs:         150            # legacy alias
-  batch_size:     32             # reduced from 64 — better gradient estimates
-  lr:             0.0005         # reduced from 0.001 — slower, more careful learning
-  patience:       20             # increased from 8 — more time before stopping
-  seq_len:        30             # sequence length for DataLoader
+  batch_size:     32
+  lr:             0.0005
+  patience:       150            # matches max_epochs — early stopping disabled
+  seq_len:        30
   grad_clip:      1.0
-  weight_decay:   0.0001         # Adam L2 regularisation
-  lr_factor:      0.5            # ReduceLROnPlateau factor
-  lr_patience:    5              # reduced from 7 — reduce LR sooner when stuck
-  num_workers:    2              # DataLoader worker threads
+  weight_decay:   0.0001
+  lr_factor:      0.5
+  lr_patience:    5
+  num_workers:    2
   checkpoint_dir: "src/models/checkpoints"
 
 news:
