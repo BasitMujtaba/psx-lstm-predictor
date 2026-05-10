@@ -48,6 +48,7 @@ import os
 import logging
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -181,7 +182,9 @@ def train(model, train_loader, val_loader,
     best_val   = float("inf")
     no_improve = 0
 
-    for epoch in range(1, max_epochs + 1):
+    pbar = tqdm(range(1, max_epochs + 1), desc="Training", unit="epoch")
+
+    for epoch in pbar:
         train_loss = _train_epoch(
             model, train_loader, criterion, optimiser, device, grad_clip
         )
@@ -193,6 +196,12 @@ def train(model, train_loader, val_loader,
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["lr"].append(current_lr)
+
+        pbar.set_postfix({
+            "train": f"{train_loss:.6f}",
+            "val":   f"{val_loss:.6f}",
+            "lr":    f"{current_lr:.2e}",
+        })
 
         log.info(
             "Epoch %3d/%d  train=%.6f  val=%.6f  lr=%.2e",
@@ -212,6 +221,10 @@ def train(model, train_loader, val_loader,
 
         # ── Early stopping ─────────────────────────────────────────────
         if no_improve >= patience:
+            tqdm.write(
+                f"Early stopping at epoch {epoch} "
+                f"(no improvement for {patience} epochs)"
+            )
             log.info(
                 "Early stopping at epoch %d  "
                 "(no improvement for %d epochs)",
