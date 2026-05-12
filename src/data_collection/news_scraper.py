@@ -16,6 +16,10 @@ Date alignment:
   - Weekend / holiday articles  -> forward-filled to next trading day
   - Pre-market news (before 9am)-> impacts same day T
   - After-market news           -> forward-filled to T+1
+
+Relevance filtering:
+  - Every article title must contain at least one Pakistan/PSX anchor
+  - Irrelevant articles are dropped before FinBERT scoring
 """
 
 import os, asyncio, logging, hashlib, warnings, sys, subprocess
@@ -38,6 +42,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger(__name__)
 
 GNEWS_RSS = "https://news.google.com/rss/search"
+
+# ── Relevance anchors ─────────────────────────────────────────────────────────
+_RELEVANCE_ANCHORS = [
+    "pakistan", "psx", "kse", "pkr", "karachi", "lahore", "islamabad",
+    "rupee", "sbp", "secp", "hbl", "mcb", "ubl", "ogdc", "ppl", "engro",
+    "ffbl", "fatima", "luck", "dgkc", "psmc", "indu", "searl", "ptcl",
+    "nccpl", "nepra", "fbr", "cpec", "imf pakistan", "pakistan stock",
+    "pakistani", "islamabad", "lahore stock", "karachi stock",
+]
+
+def _is_relevant(title: str) -> bool:
+    t = title.lower()
+    return any(anchor in t for anchor in _RELEVANCE_ANCHORS)
 
 # ── Colab-safe PROJECT_ROOT ───────────────────────────────────────────────────
 try:
@@ -67,13 +84,19 @@ def _resolve(cfg_path):
     return os.path.join(PROJECT_ROOT, cfg_path)
 
 
-def _cache_valid(path, start, end):
+def _cache_valid(path):
     if not os.path.exists(path):
         return False
-    df = pd.read_csv(path, parse_dates=["date"])
-    end_dt = pd.Timestamp(end)
-    return (df["date"].min() <= pd.Timestamp(start) + pd.Timedelta(days=5) and
-            df["date"].max() >= end_dt - pd.Timedelta(days=5))
+    try:
+        df = pd.read_csv(path, parse_dates=["date"])
+        if df.empty:
+            return False
+        log.info("Cache hit — CSV covers %s -> %s (%d rows)",
+                 df["date"].min().date(), df["date"].max().date(), len(df))
+        return True
+    except Exception as e:
+        log.warning("Cache check failed: %s", e)
+        return False
 
 
 def _push_to_github(files, start, end):
@@ -96,218 +119,218 @@ def _push_to_github(files, start, end):
 QUERY_CATEGORIES = {
 
     "macro_pakistan": [
-        "IMF Pakistan loan bailout package",
-        "Pakistan economy GDP inflation",
-        "State Bank Pakistan interest rate",
-        "Pakistani rupee PKR devaluation",
-        "Pakistan foreign exchange reserves",
+        "IMF Pakistan loan bailout package KSE",
+        "Pakistan economy GDP inflation PSX",
+        "State Bank Pakistan interest rate PKR",
+        "Pakistani rupee PKR devaluation forex",
+        "Pakistan foreign exchange reserves SBP",
         "Pakistan current account deficit surplus",
-        "Pakistan budget deficit fiscal policy",
-        "Pakistan inflation CPI SPI",
-        "Pakistan remittances workers inflow",
+        "Pakistan budget deficit fiscal policy FBR",
+        "Pakistan inflation CPI SPI economy",
+        "Pakistan remittances workers inflow PKR",
         "Pakistan trade balance exports imports",
-        "Pakistan external debt repayment",
-        "Pakistan tax revenue FBR collection",
-        "Pakistan monetary policy tightening easing",
-        "Pakistan credit rating Moody Fitch",
-        "Pakistan economic reform privatisation",
-        "Pakistan FATF grey list compliance",
-        "Pakistan circular debt energy sector",
-        "Pakistan poverty unemployment economy",
-        "Pakistan agriculture crop wheat cotton",
+        "Pakistan external debt repayment IMF",
+        "Pakistan tax revenue FBR collection economy",
+        "Pakistan monetary policy tightening easing SBP",
+        "Pakistan credit rating Moody Fitch economy",
+        "Pakistan economic reform privatisation PSX",
+        "Pakistan FATF grey list compliance economy",
+        "Pakistan circular debt energy economy",
+        "Pakistan poverty unemployment economy KSE",
+        "Pakistan agriculture crop wheat cotton economy",
         "Pakistan manufacturing LSM industrial output",
     ],
 
     "psx_market": [
         "PSX Pakistan Stock Exchange KSE100",
-        "KSE100 index bullish bearish",
-        "PSX company earnings results",
-        "Pakistan stock market rally sell-off",
-        "KSE100 record high low points",
-        "PSX foreign investor outflow inflow",
-        "Pakistan stock exchange listing IPO",
-        "PSX circuit breaker trading halt",
-        "KSE100 market capitalization",
-        "PSX brokerage TREC regulations",
-        "Pakistan equity market outlook",
-        "KSE100 dividend yield returns",
-        "PSX SECP regulations compliance",
-        "Pakistan stock market correction crash",
-        "KSE AllShare index performance",
-        "PSX trading volume turnover",
-        "Pakistan mutual fund AUM flows",
-        "PSX index rebalancing constituents",
-        "Pakistan capital market development",
-        "SECP Pakistan securities policy",
+        "KSE100 index bullish bearish PSX",
+        "PSX company earnings results KSE",
+        "Pakistan stock market rally sell-off KSE100",
+        "KSE100 record high low points PSX",
+        "PSX foreign investor outflow inflow KSE",
+        "Pakistan stock exchange listing IPO PSX",
+        "PSX circuit breaker trading halt KSE100",
+        "KSE100 market capitalization PSX",
+        "PSX brokerage TREC regulations SECP",
+        "Pakistan equity market outlook KSE100",
+        "KSE100 dividend yield returns PSX",
+        "PSX SECP regulations compliance KSE",
+        "Pakistan stock market correction crash KSE100",
+        "KSE AllShare index performance PSX",
+        "PSX trading volume turnover KSE100",
+        "Pakistan mutual fund AUM flows PSX",
+        "PSX index rebalancing constituents KSE",
+        "Pakistan capital market development PSX",
+        "SECP Pakistan securities policy KSE100",
     ],
 
     "energy_oil": [
-        "Pakistan oil gas OGDC PPL",
-        "crude oil OPEC Pakistan impact",
-        "Pakistan LNG energy crisis",
-        "Pakistan petroleum fuel price",
-        "Pakistan electricity tariff hike",
-        "Pakistan power sector NEPRA",
-        "Pakistan gas shortage winter",
-        "Pakistan refinery expansion upgrade",
-        "Pakistan renewable solar wind energy",
-        "Pakistan nuclear power plant",
-        "Pakistan petroleum levy fuel subsidy",
-        "Pakistan energy mix coal furnace oil",
-        "OGDC PPL exploration discovery",
-        "Pakistan offshore oil gas exploration",
-        "Pakistan pipeline gas import",
-        "Pakistan petrol diesel price change",
-        "Pakistan RLNG terminal import",
-        "Pakistan IPP independent power producer",
-        "Pakistan electricity load shedding",
-        "Pakistan energy transition climate",
+        "Pakistan oil gas OGDC PPL KSE",
+        "crude oil price Pakistan PSX KSE impact",
+        "Pakistan LNG energy crisis economy",
+        "Pakistan petroleum fuel price economy",
+        "Pakistan electricity tariff hike NEPRA",
+        "Pakistan power sector NEPRA KSE",
+        "Pakistan gas shortage winter economy",
+        "Pakistan refinery expansion upgrade PSX",
+        "Pakistan renewable solar wind energy KSE",
+        "Pakistan nuclear power plant economy",
+        "Pakistan petroleum levy fuel subsidy economy",
+        "Pakistan energy mix coal furnace oil KSE",
+        "OGDC PPL exploration discovery PSX",
+        "Pakistan offshore oil gas exploration KSE",
+        "Pakistan pipeline gas import economy",
+        "Pakistan petrol diesel price change PKR",
+        "Pakistan RLNG terminal import economy",
+        "Pakistan IPP independent power producer KSE",
+        "Pakistan electricity load shedding economy",
+        "Pakistan energy transition climate PSX",
     ],
 
     "banking_finance": [
-        "HBL MCB UBL Pakistan bank earnings",
-        "Pakistan banking NPL loans",
-        "Pakistan bank profit interest income",
-        "State Bank Pakistan SBP policy rate",
-        "Pakistan microfinance digital banking",
-        "Pakistan banking sector CAR capital",
-        "HBL Habib Bank international expansion",
-        "MCB Bank profit dividend",
-        "UBL United Bank earnings result",
-        "Allied Bank ABL quarterly results",
-        "Bank Alfalah BAFL performance",
-        "Meezan Bank Islamic finance growth",
-        "Pakistan fintech digital payments",
-        "Pakistan banking NPL provisioning",
-        "Pakistan credit growth private sector",
-        "Pakistan T-bill PIB yields auction",
-        "Pakistan banking sector merger acquisition",
-        "NBP National Bank Pakistan results",
-        "Pakistan insurance sector takaful",
-        "Pakistan mortgage housing finance",
+        "HBL MCB UBL Pakistan bank earnings PSX",
+        "Pakistan banking NPL loans KSE",
+        "Pakistan bank profit interest income PSX",
+        "State Bank Pakistan SBP policy rate PKR",
+        "Pakistan microfinance digital banking KSE",
+        "Pakistan banking sector CAR capital PSX",
+        "HBL Habib Bank profit dividend PSX",
+        "MCB Bank profit dividend KSE results",
+        "UBL United Bank earnings result PSX",
+        "Allied Bank ABL quarterly results KSE",
+        "Bank Alfalah BAFL performance PSX",
+        "Meezan Bank Islamic finance growth KSE",
+        "Pakistan fintech digital payments economy",
+        "Pakistan banking NPL provisioning KSE",
+        "Pakistan credit growth private sector SBP",
+        "Pakistan T-bill PIB yields auction SBP",
+        "Pakistan banking sector merger acquisition PSX",
+        "NBP National Bank Pakistan results KSE",
+        "Pakistan insurance sector takaful PSX",
+        "Pakistan mortgage housing finance KSE",
     ],
 
     "geopolitical_global": [
-        "Pakistan India tensions conflict",
-        "Pakistan China CPEC investment",
-        "Iran Pakistan pipeline deal",
-        "US Federal Reserve emerging markets",
-        "Russia Ukraine commodity Pakistan",
-        "Pakistan Saudi Arabia UAE investment",
-        "Pakistan Afghanistan border trade",
-        "Pakistan Turkey bilateral trade",
-        "Pakistan US relations sanctions",
-        "China Pakistan economic corridor update",
-        "Pakistan Gulf remittances workers",
-        "Pakistan Asia emerging market capital",
-        "Global commodity prices Pakistan impact",
-        "Pakistan dollar shortage forex crisis",
-        "Pakistan regional connectivity trade",
-        "Pakistan Iran border trade sanctions",
-        "Pakistan SCO Shanghai Cooperation",
-        "Pakistan IMF World Bank ADB loans",
-        "Pakistan Belt Road Initiative BRI",
-        "Pakistan diaspora investment bonds",
+        "Pakistan India tensions conflict economy PSX",
+        "Pakistan China CPEC investment KSE",
+        "Iran Pakistan pipeline deal economy",
+        "US Federal Reserve rate Pakistan rupee PKR",
+        "Russia Ukraine commodity Pakistan economy",
+        "Pakistan Saudi Arabia UAE investment PKR",
+        "Pakistan Afghanistan border trade economy",
+        "Pakistan Turkey bilateral trade economy",
+        "Pakistan US relations sanctions economy",
+        "China Pakistan economic corridor CPEC KSE",
+        "Pakistan Gulf remittances workers PKR",
+        "Pakistan emerging market capital KSE100",
+        "commodity prices Pakistan impact PSX",
+        "Pakistan dollar shortage forex crisis PKR",
+        "Pakistan regional connectivity trade economy",
+        "Pakistan Iran border trade sanctions economy",
+        "Pakistan SCO Shanghai Cooperation economy",
+        "Pakistan IMF World Bank ADB loans economy",
+        "Pakistan Belt Road Initiative BRI CPEC",
+        "Pakistan diaspora investment bonds PKR",
     ],
 
     "political_stability": [
-        "Pakistan political crisis government",
-        "Pakistan elections economy",
-        "Pakistan Prime Minister policy",
-        "Pakistan army military political",
-        "Pakistan Supreme Court ruling economy",
-        "Pakistan PTI PDM government policy",
-        "Pakistan coalition government stability",
-        "Pakistan protest strike business impact",
-        "Pakistan martial law constitutional crisis",
-        "Pakistan general election result",
-        "Pakistan cabinet reshuffle minister",
-        "Pakistan parliament budget approval",
-        "Pakistan provincial government KPK Punjab Sindh",
-        "Pakistan political uncertainty investor",
-        "Pakistan governance reform accountability",
-        "Pakistan NAB corruption case business",
-        "Pakistan Senate National Assembly legislation",
-        "Pakistan political party economic agenda",
-        "Pakistan civil military relations",
-        "Pakistan policy continuity investor confidence",
+        "Pakistan political crisis government economy",
+        "Pakistan elections economy PSX KSE",
+        "Pakistan Prime Minister policy economy",
+        "Pakistan army military political economy",
+        "Pakistan Supreme Court ruling economy PSX",
+        "Pakistan PTI PDM government policy economy",
+        "Pakistan coalition government stability KSE",
+        "Pakistan protest strike business PSX impact",
+        "Pakistan constitutional crisis economy KSE",
+        "Pakistan general election result economy",
+        "Pakistan cabinet reshuffle minister economy",
+        "Pakistan parliament budget approval economy",
+        "Pakistan provincial government economy KSE",
+        "Pakistan political uncertainty investor PSX",
+        "Pakistan governance reform accountability KSE",
+        "Pakistan NAB corruption case business PSX",
+        "Pakistan Senate National Assembly legislation economy",
+        "Pakistan political party economic agenda PSX",
+        "Pakistan civil military relations economy",
+        "Pakistan policy continuity investor confidence PSX",
     ],
 
     "pakistani_media": [
-        "Dawn News Pakistan economy stock",
-        "Geo News Pakistan business finance",
-        "ARY News Pakistan economy market",
-        "The News International Pakistan stocks",
-        "Express Tribune Pakistan economy PSX",
-        "Business Recorder Pakistan KSE market",
-        "Pakistan Observer economy inflation",
-        "Daily Pakistan economy rupee",
-        "Samaa News Pakistan economic crisis",
-        "Dunya News Pakistan economy budget",
-        "Profit Pakistan business finance",
-        "Pakistan Today market economy",
-        "Tribune Express Pakistan business",
-        "Dawn Business Pakistan corporate results",
-        "Geo Business Pakistan finance news",
+        "Dawn News Pakistan economy stock KSE",
+        "Geo News Pakistan business finance PSX",
+        "ARY News Pakistan economy market KSE",
+        "The News International Pakistan stocks PSX",
+        "Express Tribune Pakistan economy PSX KSE",
+        "Business Recorder Pakistan KSE market PSX",
+        "Pakistan Observer economy inflation KSE",
+        "Daily Pakistan economy rupee PKR",
+        "Samaa News Pakistan economic crisis KSE",
+        "Dunya News Pakistan economy budget PSX",
+        "Profit Pakistan business finance KSE",
+        "Pakistan Today market economy PSX",
+        "Tribune Express Pakistan business KSE",
+        "Dawn Business Pakistan corporate results PSX",
+        "Geo Business Pakistan finance news KSE",
     ],
 
     "international_media_pakistan": [
-        "Reuters Pakistan economy market",
-        "Bloomberg Pakistan stocks rupee",
-        "Financial Times Pakistan economy",
-        "Wall Street Journal Pakistan",
-        "Al Jazeera Pakistan economy crisis",
-        "BBC Pakistan economy inflation",
-        "CNBC Pakistan emerging market",
-        "The Economist Pakistan economy",
-        "Associated Press Pakistan finance",
-        "South China Morning Post Pakistan CPEC",
-        "Nikkei Asia Pakistan economy",
-        "Gulf News Pakistan economy remittances",
-        "Arab News Pakistan trade investment",
-        "Middle East Eye Pakistan economy",
-        "AFP Pakistan economy stock market",
+        "Reuters Pakistan economy market KSE PSX",
+        "Bloomberg Pakistan stocks rupee PKR",
+        "Financial Times Pakistan economy KSE",
+        "Wall Street Journal Pakistan economy PSX",
+        "Al Jazeera Pakistan economy crisis KSE",
+        "BBC Pakistan economy inflation PSX",
+        "CNBC Pakistan emerging market KSE100",
+        "The Economist Pakistan economy PSX",
+        "Associated Press Pakistan finance KSE",
+        "South China Morning Post Pakistan CPEC economy",
+        "Nikkei Asia Pakistan economy KSE",
+        "Gulf News Pakistan economy remittances PKR",
+        "Arab News Pakistan trade investment economy",
+        "Middle East Eye Pakistan economy KSE",
+        "AFP Pakistan economy stock market PSX",
     ],
 
     "psx_official_corporate": [
-        "PSX official announcement Pakistan Exchange",
+        "PSX official announcement Pakistan Exchange KSE100",
         "SECP Securities Exchange Commission Pakistan order",
-        "Pakistan stock exchange new listing",
-        "PSX corporate disclosure financial results",
-        "Pakistan company quarterly annual results",
-        "PSX dividend announcement Pakistan",
-        "Pakistan company rights issue bonus",
-        "SECP enforcement action Pakistan company",
-        "PSX trading rules regulations update",
-        "Pakistan company merger acquisition PSX",
-        "PSX index methodology change",
-        "Pakistan Exchange Traded Fund ETF",
-        "PSX market maker liquidity provider",
-        "Pakistan company AGM EGM announcement",
-        "SECP prospectus IPO approval Pakistan",
-        "PSX corporate governance compliance",
-        "Pakistan privatisation divestment PSX",
-        "PSX settlement clearing NCCPL",
-        "Pakistan company sukuk bond issue",
-        "SECP mutual fund regulations Pakistan",
+        "Pakistan stock exchange new listing PSX",
+        "PSX corporate disclosure financial results KSE",
+        "Pakistan company quarterly annual results PSX",
+        "PSX dividend announcement Pakistan KSE",
+        "Pakistan company rights issue bonus PSX",
+        "SECP enforcement action Pakistan company KSE",
+        "PSX trading rules regulations update SECP",
+        "Pakistan company merger acquisition PSX KSE",
+        "PSX index methodology change KSE100",
+        "Pakistan Exchange Traded Fund ETF PSX",
+        "PSX market maker liquidity provider KSE",
+        "Pakistan company AGM EGM announcement PSX",
+        "SECP prospectus IPO approval Pakistan PSX",
+        "PSX corporate governance compliance SECP",
+        "Pakistan privatisation divestment PSX KSE",
+        "PSX settlement clearing NCCPL KSE",
+        "Pakistan company sukuk bond issue PSX",
+        "SECP mutual fund regulations Pakistan PSX",
     ],
 
     "sector_specific": [
-        "Pakistan cement sector demand prices LUCK DGKC",
-        "Pakistan fertiliser sector ENGRO FFBL FATIMA",
-        "Pakistan textile sector exports quota",
-        "Pakistan auto sector PSMC INDU sales",
-        "Pakistan pharma sector SEARL HINOON results",
-        "Pakistan telecom PTCL Jazz Telenor",
-        "Pakistan steel sector ISL ASTL demand",
-        "Pakistan sugar sector mill crushing",
-        "Pakistan chemicals sector ICI Lotte",
-        "Pakistan food sector NESTLE UNILEVER FFL",
-        "Pakistan real estate property DHA",
-        "Pakistan technology IT exports software",
-        "Pakistan media PEMRA broadcast advertising",
-        "Pakistan tobacco PMI PAKT results",
-        "Pakistan glass packaging Ghani AGC",
+        "Pakistan cement sector LUCK DGKC PSX KSE",
+        "Pakistan fertiliser ENGRO FFBL FATIMA PSX",
+        "Pakistan textile sector exports KSE PSX",
+        "Pakistan auto sector PSMC INDU PSX KSE",
+        "Pakistan pharma SEARL HINOON results PSX",
+        "Pakistan telecom PTCL Jazz Telenor KSE",
+        "Pakistan steel sector ISL ASTL PSX KSE",
+        "Pakistan sugar sector mill PSX KSE",
+        "Pakistan chemicals ICI Lotte PSX KSE",
+        "Pakistan food NESTLE UNILEVER FFL PSX",
+        "Pakistan real estate property PSX KSE",
+        "Pakistan technology IT exports PSX KSE",
+        "Pakistan media PEMRA broadcast PSX KSE",
+        "Pakistan tobacco PAKT results PSX KSE",
+        "Pakistan glass packaging Ghani PSX KSE",
     ],
 }
 
@@ -346,6 +369,9 @@ async def _fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk)
                     pub_dt = datetime(*pub[:6]) if pub else datetime.strptime(after, "%Y-%m-%d")
                     title  = entry.get("title", "").strip()
                     if not title:
+                        continue
+                    # ── Relevance filter ──────────────────────────────────────
+                    if not _is_relevant(title):
                         continue
                     h = hashlib.md5(title.lower().encode()).hexdigest()
                     if h not in seen_hash:
@@ -459,7 +485,8 @@ def align_to_trading_days(df, trading_dates):
     def _map_date(row):
         d    = pd.Timestamp(row["date"]).normalize()
         hour = row["hour"]
-        if d in trading_dates and hour >= 11:
+        # PSX closes ~15:30 PKT = 10:30 UTC; treat hour >= 10 UTC as after-market
+        if d in trading_dates and hour >= 10:
             idx = trading_dates.get_loc(d)
             if idx + 1 < len(trading_dates):
                 return trading_dates[idx + 1]
@@ -527,7 +554,7 @@ def run(cfg=None, trading_dates=None):
     os.makedirs(processed_dir, exist_ok=True)
 
     # ── Cache check ───────────────────────────────────────────────────────────
-    if _cache_valid(sentiment_path, start, end):
+    if _cache_valid(sentiment_path):
         log.info("✅ Cache valid — loading sentiment from disk")
         return pd.read_csv(sentiment_path, parse_dates=["date"])
 
