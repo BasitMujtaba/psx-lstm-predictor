@@ -66,13 +66,19 @@ def _resolve(cfg_path):
     return os.path.join(PROJECT_ROOT, cfg_path)
 
 
-def _cache_valid(path, start, end):
+def _cache_valid(path):
     if not os.path.exists(path):
         return False
-    df = pd.read_csv(path, parse_dates=["date"])
-    end_dt = pd.Timestamp(end)
-    return (df["date"].min() <= pd.Timestamp(start) + pd.Timedelta(days=5) and
-            df["date"].max() >= end_dt - pd.Timedelta(days=5))
+    try:
+        df = pd.read_csv(path, parse_dates=["date"])
+        if df.empty:
+            return False
+        log.info("Cache hit — CSV covers %s -> %s (%d rows)",
+                 df["date"].min().date(), df["date"].max().date(), len(df))
+        return True
+    except Exception as e:
+        log.warning("Cache check failed: %s", e)
+        return False
 
 
 def _push_to_github(raw_path, processed_path, start, end):
@@ -339,7 +345,7 @@ def run(cfg=None):
     os.makedirs(raw_dir,       exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
-    if _cache_valid(processed_path, start, end):
+    if _cache_valid(processed_path):
         log.info("Cache valid — loading processed prices from disk")
         return pd.read_csv(processed_path, parse_dates=["date"])
 
