@@ -65,8 +65,9 @@ def _cache_valid(path, start, end):
     if not os.path.exists(path):
         return False
     df = pd.read_csv(path, parse_dates=["date"])
+    end_dt = pd.Timestamp(end)
     return (str(df["date"].min().date()) <= start and
-            str(df["date"].max().date()) >= end)
+            df["date"].max() >= end_dt - pd.Timedelta(days=5))
 
 
 def _push_to_github(raw_path, processed_path, start, end):
