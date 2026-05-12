@@ -66,7 +66,7 @@ def _cache_valid(path, start, end):
         return False
     df = pd.read_csv(path, parse_dates=["date"])
     end_dt = pd.Timestamp(end)
-    return (str(df["date"].min().date()) <= start and
+    return (df["date"].min() <= pd.Timestamp(start) + pd.Timedelta(days=5) and
             df["date"].max() >= end_dt - pd.Timedelta(days=5))
 
 
