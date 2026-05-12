@@ -34,19 +34,14 @@ from tqdm import tqdm
 import yaml
 
 warnings.filterwarnings("ignore")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
 GNEWS_RSS = "https://news.google.com/rss/search"
 
 # ── Colab-safe PROJECT_ROOT ───────────────────────────────────────────────────
 try:
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__)
-    )))
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 except NameError:
     _cwd = os.path.abspath(".")
     PROJECT_ROOT = _cwd
@@ -70,6 +65,14 @@ def _resolve(cfg_path):
     if os.path.isabs(cfg_path):
         return cfg_path
     return os.path.join(PROJECT_ROOT, cfg_path)
+
+
+def _cache_valid(path, start, end):
+    if not os.path.exists(path):
+        return False
+    df = pd.read_csv(path, parse_dates=["date"])
+    return (str(df["date"].min().date()) <= start and
+            str(df["date"].max().date()) >= end)
 
 
 # ── Categorised Query Bank ────────────────────────────────────────────────────
@@ -302,9 +305,7 @@ def _build_jobs(start, end, chunk_months):
     for category, queries in QUERY_CATEGORIES.items():
         cursor = start_dt
         while cursor < end_dt:
-            next_cur = min(
-                cursor + relativedelta(months=chunk_months), end_dt
-            )
+            next_cur = min(cursor + relativedelta(months=chunk_months), end_dt)
             for query in queries:
                 jobs.append({
                     "category": category,
@@ -317,22 +318,13 @@ def _build_jobs(start, end, chunk_months):
 
 
 async def _fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk):
-    q      = job["query"]
-    after  = job["after"]
-    before = job["before"]
-    cat    = job["category"]
-    url = (
-        f"{GNEWS_RSS}?q={quote_plus(f'{q} after:{after} before:{before}')}"
-        f"&hl=en-US&gl=PK&ceid=PK:en"
-    )
+    q, after, before, cat = job["query"], job["after"], job["before"], job["category"]
+    url = (f"{GNEWS_RSS}?q={quote_plus(f'{q} after:{after} before:{before}')}"
+           f"&hl=en-US&gl=PK&ceid=PK:en")
     async with semaphore:
         try:
-            async with session.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-            ) as resp:
-                content = await resp.read()
-                feed    = feedparser.parse(content)
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                feed = feedparser.parse(await resp.read())
                 for entry in feed.entries[:max_per_chunk]:
                     pub    = entry.get("published_parsed") or entry.get("updated_parsed")
                     pub_dt = datetime(*pub[:6]) if pub else datetime.strptime(after, "%Y-%m-%d")
@@ -358,38 +350,19 @@ async def _run_all_jobs(jobs, max_per_chunk, concurrency):
     seen_hash = set()
     results   = []
     semaphore = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(
-        limit                 = concurrency,
-        ttl_dns_cache         = 300,
-        enable_cleanup_closed = True,
-    )
-    timeout = aiohttp.ClientTimeout(total=10, connect=5)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = [
-            asyncio.ensure_future(
-                _fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk)
-            )
-            for job in jobs
-        ]
-        for coro in tqdm(
-            asyncio.as_completed(tasks),
-            total=len(tasks),
-            desc="Fetching RSS",
-            unit="req",
-            ncols=80,
-        ):
+    connector = aiohttp.TCPConnector(limit=concurrency, ttl_dns_cache=300, enable_cleanup_closed=True)
+    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=10, connect=5)) as session:
+        tasks = [asyncio.ensure_future(_fetch_job(session, job, semaphore, seen_hash, results, max_per_chunk))
+                 for job in jobs]
+        for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching RSS", unit="req", ncols=80):
             await coro
     return results
 
 
 def collect_all_articles(start, end, chunk_months, max_per_chunk, concurrency=50):
     jobs = _build_jobs(start, end, chunk_months)
-    total_queries = sum(len(v) for v in QUERY_CATEGORIES.values())
-    log.info(
-        "Jobs: %d categories | %d queries | %d RSS requests",
-        len(QUERY_CATEGORIES), total_queries, len(jobs),
-    )
-
+    log.info("Jobs: %d categories | %d queries | %d RSS requests",
+             len(QUERY_CATEGORIES), sum(len(v) for v in QUERY_CATEGORIES.values()), len(jobs))
     nest_asyncio.apply()
 
     async def _run():
@@ -397,8 +370,7 @@ def collect_all_articles(start, end, chunk_months, max_per_chunk, concurrency=50
 
     try:
         asyncio.get_running_loop()
-        loop = asyncio.get_event_loop()
-        results = loop.run_until_complete(_run())
+        results = asyncio.get_event_loop().run_until_complete(_run())
     except RuntimeError:
         results = asyncio.run(_run())
 
@@ -409,10 +381,7 @@ def collect_all_articles(start, end, chunk_months, max_per_chunk, concurrency=50
     df = pd.DataFrame(results)
     df["date"] = pd.to_datetime(df["date"])
     df.sort_values("date", inplace=True)
-    log.info(
-        "\u2713 Unique articles collected: %d  (from %d requests)",
-        len(df), len(jobs),
-    )
+    log.info("✓ Unique articles collected: %d  (from %d requests)", len(df), len(jobs))
     return df.reset_index(drop=True)
 
 
@@ -421,10 +390,8 @@ def collect_all_articles(start, end, chunk_months, max_per_chunk, concurrency=50
 class _TextDataset(Dataset):
     def __init__(self, encodings):
         self.encodings = encodings
-
     def __len__(self):
         return self.encodings["input_ids"].shape[0]
-
     def __getitem__(self, idx):
         return {k: v[idx] for k, v in self.encodings.items()}
 
@@ -434,16 +401,15 @@ class FinBERTScorer:
 
     def __init__(self, model_name, batch_size=None):
         log.info("Loading FinBERT: %s", model_name)
-        self.tok   = BertTokenizer.from_pretrained(model_name)
-        self.model = BertForSequenceClassification.from_pretrained(model_name)
+        self.tok    = BertTokenizer.from_pretrained(model_name)
+        self.model  = BertForSequenceClassification.from_pretrained(model_name)
         self.model.eval()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         if torch.cuda.is_available():
             self.model = self.model.half()
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
-            log.info("GPU: %s  (%.1f GB VRAM)", gpu_name, gpu_mem)
+            gpu_mem    = torch.cuda.get_device_properties(0).total_memory / 1e9
+            log.info("GPU: %s  (%.1f GB VRAM)", torch.cuda.get_device_name(0), gpu_mem)
             self.bs = batch_size or (128 if gpu_mem >= 14 else 64)
         else:
             log.warning("No GPU found — running on CPU (will be slow)")
@@ -453,32 +419,20 @@ class FinBERTScorer:
     def score(self, texts):
         if not texts:
             return pd.DataFrame(columns=["sentiment_score", "sentiment_label"])
-        log.info("Tokenising %d texts ...", len(texts))
-        encodings = self.tok(
-            texts, padding=True, truncation=True,
-            max_length=128, return_tensors="pt",
-        )
-        dataset = _TextDataset(encodings)
-        loader  = DataLoader(
-            dataset, batch_size=self.bs, shuffle=False,
-            pin_memory=(self.device.type == "cuda"), num_workers=0,
-        )
+        encodings = self.tok(texts, padding=True, truncation=True, max_length=128, return_tensors="pt")
+        loader    = DataLoader(_TextDataset(encodings), batch_size=self.bs, shuffle=False,
+                               pin_memory=(self.device.type == "cuda"), num_workers=0)
         all_scores, all_labels = [], []
-        log.info("Running FinBERT inference on %s ...", self.device)
         with torch.no_grad():
             for batch in tqdm(loader, desc=f"FinBERT [{self.device}]", unit="batch"):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch  = {k: v.to(self.device) for k, v in batch.items()}
                 with torch.cuda.amp.autocast(enabled=(self.device.type == "cuda")):
                     logits = self.model(**batch).logits
                 probs = F.softmax(logits.float(), dim=-1).cpu()
                 all_scores.extend((probs[:, 0] - probs[:, 1]).tolist())
-                all_labels.extend(
-                    [self.LABEL_MAP[i] for i in probs.argmax(dim=-1).tolist()]
-                )
-        return pd.DataFrame({
-            "sentiment_score": [round(s, 4) for s in all_scores],
-            "sentiment_label": all_labels,
-        })
+                all_labels.extend([self.LABEL_MAP[i] for i in probs.argmax(dim=-1).tolist()])
+        return pd.DataFrame({"sentiment_score": [round(s, 4) for s in all_scores],
+                             "sentiment_label": all_labels})
 
 
 # ── Date Alignment to Trading Days ───────────────────────────────────────────
@@ -489,12 +443,10 @@ def align_to_trading_days(df, trading_dates):
     def _map_date(row):
         d    = pd.Timestamp(row["date"]).normalize()
         hour = row["hour"]
-
         if d in trading_dates and hour >= 11:
             idx = trading_dates.get_loc(d)
             if idx + 1 < len(trading_dates):
                 return trading_dates[idx + 1]
-
         future = trading_dates[trading_dates >= d]
         return future[0] if len(future) > 0 else d
 
@@ -517,25 +469,15 @@ def aggregate_daily_sentiment(df, start, end, trading_dates):
     ).reset_index().rename(columns={"trading_date": "date"})
 
     daily["sentiment_label"] = daily.apply(
-        lambda r: max(
-            {"positive": r.positive_count,
-             "negative": r.negative_count,
-             "neutral":  r.neutral_count},
-            key=lambda k: {"positive": r.positive_count,
-                           "negative": r.negative_count,
-                           "neutral":  r.neutral_count}[k]
-        ), axis=1
-    )
+        lambda r: max({"positive": r.positive_count, "negative": r.negative_count, "neutral": r.neutral_count},
+                      key=lambda k: {"positive": r.positive_count, "negative": r.negative_count,
+                                     "neutral": r.neutral_count}[k]), axis=1)
 
     for cat in QUERY_CATEGORIES:
         cat_df = (df[df["category"] == cat]
-                  .groupby("trading_date")["sentiment_score"]
-                  .mean()
+                  .groupby("trading_date")["sentiment_score"].mean()
                   .reset_index()
-                  .rename(columns={
-                      "trading_date":    "date",
-                      "sentiment_score": f"{cat}_score",
-                  }))
+                  .rename(columns={"trading_date": "date", "sentiment_score": f"{cat}_score"}))
         daily = daily.merge(cat_df, on="date", how="left")
 
     full_idx = pd.date_range(start=start, end=end, freq="D")
@@ -552,22 +494,26 @@ def aggregate_daily_sentiment(df, start, end, trading_dates):
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
-def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None):
+def run(cfg=None, trading_dates=None):
     if cfg is None:
         cfg = load_config()
 
-    start    = cfg["data"]["start_date"]
-    end      = cfg["data"]["end_date"]
-    news_cfg = cfg["news"]
-
+    start         = cfg["data"]["start_date"]
+    end           = cfg["data"]["end_date"]
+    news_cfg      = cfg["news"]
     raw_news_dir  = _resolve(cfg["data"]["raw_news_dir"])
     processed_dir = _resolve(cfg["data"]["processed_dir"])
+    sentiment_path = os.path.join(processed_dir, "news_sentiment_daily.csv")
+
     os.makedirs(raw_news_dir,  exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
-    log.info("raw_news_dir  -> %s", raw_news_dir)
-    log.info("processed_dir -> %s", processed_dir)
+    # ── Cache check ───────────────────────────────────────────────────────────
+    if _cache_valid(sentiment_path, start, end):
+        log.info("✅ Cache valid — loading sentiment from disk")
+        return pd.read_csv(sentiment_path, parse_dates=["date"])
 
+    # ── Collect articles ──────────────────────────────────────────────────────
     articles_df = collect_all_articles(
         start         = start,
         end           = end,
@@ -575,40 +521,26 @@ def run(cfg=None, trading_dates=None, push_github=False, github_commit_msg=None)
         max_per_chunk = news_cfg.get("max_per_chunk", 5),
         concurrency   = news_cfg.get("concurrency", 50),
     )
+    articles_df.to_csv(os.path.join(raw_news_dir, "articles_raw.csv"), index=False)
+    log.info("✓ Raw articles saved -> %d rows", len(articles_df))
 
-    raw_articles_path = os.path.join(raw_news_dir, "articles_raw.csv")
-    articles_df.to_csv(raw_articles_path, index=False)
-    log.info("\u2713 Raw articles saved  -> %s  (%d rows)", raw_articles_path, len(articles_df))
+    # ── Score with FinBERT ────────────────────────────────────────────────────
+    score_df    = FinBERTScorer(model_name=news_cfg["finbert_model"]).score(articles_df["title"].tolist())
+    articles_df = pd.concat([articles_df.reset_index(drop=True), score_df.reset_index(drop=True)], axis=1)
+    articles_df.to_csv(os.path.join(processed_dir, "articles_scored.csv"), index=False)
+    log.info("✓ Scored articles saved -> %d rows", len(articles_df))
 
-    scorer   = FinBERTScorer(model_name=news_cfg["finbert_model"])
-    score_df = scorer.score(articles_df["title"].tolist())
-    articles_df = pd.concat(
-        [articles_df.reset_index(drop=True), score_df.reset_index(drop=True)], axis=1,
-    )
-
-    scored_path = os.path.join(processed_dir, "articles_scored.csv")
-    articles_df.to_csv(scored_path, index=False)
-    log.info("\u2713 Scored articles saved -> %s  (%d rows)", scored_path, len(articles_df))
-
+    # ── Align + aggregate ─────────────────────────────────────────────────────
     if trading_dates is None:
         trading_dates = pd.date_range(start=start, end=end, freq="B")
-    articles_df = align_to_trading_days(articles_df, trading_dates)
-
+    articles_df     = align_to_trading_days(articles_df, trading_dates)
     sentiment_daily = aggregate_daily_sentiment(articles_df, start, end, trading_dates)
-    processed_path  = os.path.join(processed_dir, "news_sentiment_daily.csv")
-    sentiment_daily.to_csv(processed_path, index=False)
-
-    if not os.path.exists(processed_path):
-        raise RuntimeError(f"Processed sentiment file NOT saved -> {processed_path}")
-    log.info(
-        "\u2713 Daily sentiment saved -> %s  (%d rows, %.1f MB)",
-        processed_path, len(sentiment_daily),
-        os.path.getsize(processed_path) / 1e6,
-    )
+    sentiment_daily.to_csv(sentiment_path, index=False)
+    log.info("✓ Daily sentiment saved -> %s  (%d rows, %.1f MB)",
+             sentiment_path, len(sentiment_daily), os.path.getsize(sentiment_path) / 1e6)
 
     return sentiment_daily
 
 
-# ── Colab-safe entry guard ────────────────────────────────────────────────────
 if __name__ == "__main__":
     run()
