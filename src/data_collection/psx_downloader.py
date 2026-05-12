@@ -7,7 +7,11 @@ and computes technical indicators.
 
 Saves:
   data/raw/psx_prices/psx_prices_raw.csv      <- OHLCV + LDCP + Change + Change(%)
-  data/processed/psx_prices_processed.csv     <- raw cols + all indicators
+  data/processed/psx_prices_processed.csv     <- raw cols + all indicators (warmup rows dropped)
+
+Warmup rows dropped per ticker:
+  - First 252 rows dropped (turbulence warmup — longest window)
+  - Then any remaining NaNs dropped (rsi, cci, bb_*, dmi_dx, ldcp)
 """
 
 import os, asyncio, logging, warnings, subprocess
@@ -46,6 +50,7 @@ _CONCURRENCY   = 4
 _TICKER_PAUSE  = 1.5
 _429_WAIT      = 8.0
 _RETRY_BACKOFF = 2.0
+_WARMUP_ROWS   = 252
 
 
 def load_config(path=None):
@@ -80,9 +85,9 @@ def _push_to_github(raw_path, processed_path, start, end):
         ]
         for cmd in cmds:
             subprocess.run(cmd, check=True, capture_output=True)
-        log.info("✅ Pushed updated CSVs to GitHub")
+        log.info("Pushed updated CSVs to GitHub")
     except subprocess.CalledProcessError as e:
-        log.warning("⚠️ GitHub push failed: %s", e.stderr.decode())
+        log.warning("GitHub push failed: %s", e.stderr.decode())
 
 
 def _clean_ticker(ticker: str) -> str:
@@ -142,6 +147,22 @@ def _derive_ldcp_change(df: pd.DataFrame) -> pd.DataFrame:
     col_order = ["date", "ticker", "ldcp", "open", "high", "low", "close",
                  "change", "change_pct", "volume"]
     return df[col_order]
+
+
+def _drop_warmup_rows(df: pd.DataFrame) -> pd.DataFrame:
+    before = len(df)
+    df = (df.groupby("ticker", group_keys=False)
+            .apply(lambda x: x.iloc[_WARMUP_ROWS:])
+            .reset_index(drop=True))
+    after_warmup = len(df)
+    df = df.dropna().reset_index(drop=True)
+    after_nan = len(df)
+    log.info(
+        "Warmup drop: %d -> %d rows (-%d warmup) -> %d rows (-%d NaN)",
+        before, after_warmup, before - after_warmup,
+        after_nan, after_warmup - after_nan
+    )
+    return df
 
 
 async def _fetch_month_async(session, semaphore, symbol, year, month, retries=4):
@@ -214,7 +235,7 @@ def fetch_psx_prices(tickers, start, end, concurrency=_CONCURRENCY):
                         failed.append(ticker)
                     else:
                         valid.append(df)
-                        log.info("[%s] ✓ %d rows", symbol, len(df))
+                        log.info("[%s] %d rows", symbol, len(df))
                 await asyncio.sleep(_TICKER_PAUSE)
         return valid, failed
 
@@ -292,11 +313,14 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     result = pd.concat(frames, ignore_index=True)
     result.sort_values(["ticker", "date"], inplace=True)
     result.reset_index(drop=True, inplace=True)
+
+    result = _drop_warmup_rows(result)
+
     indicator_cols = (["macd", "rsi", "cci", "dmi_dx"]
                       + [f"ema_{p}" for p in _EMA_PERIODS]
                       + ["bb_mid", "bb_upper", "bb_lower", "bb_width", "bb_pct", "turbulence"])
-    log.info("NaN %% per indicator:\n%s",
-             result[indicator_cols].isna().mean().mul(100).round(1).to_string())
+    nan_report = result[indicator_cols].isna().mean().mul(100).round(1).to_string()
+    log.info("NaN per indicator (should all be 0.0 after warmup drop): %s", nan_report)
     return result
 
 
@@ -315,26 +339,22 @@ def run(cfg=None):
     os.makedirs(raw_dir,       exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
-    # ── Cache check ───────────────────────────────────────────────────────────
     if _cache_valid(processed_path, start, end):
-        log.info("✅ Cache valid — loading processed prices from disk")
+        log.info("Cache valid — loading processed prices from disk")
         return pd.read_csv(processed_path, parse_dates=["date"])
 
-    # ── Fetch + save raw ──────────────────────────────────────────────────────
     raw_df, failed = fetch_psx_prices(tickers, start, end)
     if failed:
         log.warning("Tickers with no data: %s", failed)
     raw_df.to_csv(raw_path, index=False)
-    log.info("✓ Raw saved -> %s  (%d rows, %.1f MB)",
+    log.info("Raw saved -> %s  (%d rows, %.1f MB)",
              raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
 
-    # ── Add indicators + save processed ──────────────────────────────────────
     processed_df = add_technical_indicators(raw_df)
     processed_df.to_csv(processed_path, index=False)
-    log.info("✓ Processed saved -> %s  (%d rows, %.1f MB)",
+    log.info("Processed saved -> %s  (%d rows, %.1f MB)",
              processed_path, len(processed_df), os.path.getsize(processed_path) / 1e6)
 
-    # ── Push updated CSVs to GitHub ───────────────────────────────────────────
     _push_to_github(raw_path, processed_path, start, end)
 
     return processed_df
