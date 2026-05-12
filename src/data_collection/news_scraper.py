@@ -18,7 +18,7 @@ Date alignment:
   - After-market news           -> forward-filled to T+1
 """
 
-import os, asyncio, logging, hashlib, warnings, sys
+import os, asyncio, logging, hashlib, warnings, sys, subprocess
 from datetime import datetime
 from urllib.parse import quote_plus
 from dateutil.relativedelta import relativedelta
@@ -71,8 +71,24 @@ def _cache_valid(path, start, end):
     if not os.path.exists(path):
         return False
     df = pd.read_csv(path, parse_dates=["date"])
-    return (str(df["date"].min().date()) <= start and
-            str(df["date"].max().date()) >= end)
+    end_dt = pd.Timestamp(end)
+    return (df["date"].min() <= pd.Timestamp(start) + pd.Timedelta(days=5) and
+            df["date"].max() >= end_dt - pd.Timedelta(days=5))
+
+
+def _push_to_github(files, start, end):
+    try:
+        cmds = [
+            ["git", "-C", PROJECT_ROOT, "add"] + files,
+            ["git", "-C", PROJECT_ROOT, "commit", "-m",
+             f"Update news sentiment cache {start} -> {end}"],
+            ["git", "-C", PROJECT_ROOT, "push"],
+        ]
+        for cmd in cmds:
+            subprocess.run(cmd, check=True, capture_output=True)
+        log.info("✅ Pushed updated CSVs to GitHub")
+    except subprocess.CalledProcessError as e:
+        log.warning("⚠️ GitHub push failed: %s", e.stderr.decode())
 
 
 # ── Categorised Query Bank ────────────────────────────────────────────────────
@@ -503,7 +519,9 @@ def run(cfg=None, trading_dates=None):
     news_cfg      = cfg["news"]
     raw_news_dir  = _resolve(cfg["data"]["raw_news_dir"])
     processed_dir = _resolve(cfg["data"]["processed_dir"])
-    sentiment_path = os.path.join(processed_dir, "news_sentiment_daily.csv")
+    sentiment_path    = os.path.join(processed_dir, "news_sentiment_daily.csv")
+    raw_articles_path = os.path.join(raw_news_dir,  "articles_raw.csv")
+    scored_path       = os.path.join(processed_dir, "articles_scored.csv")
 
     os.makedirs(raw_news_dir,  exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
@@ -521,13 +539,13 @@ def run(cfg=None, trading_dates=None):
         max_per_chunk = news_cfg.get("max_per_chunk", 5),
         concurrency   = news_cfg.get("concurrency", 50),
     )
-    articles_df.to_csv(os.path.join(raw_news_dir, "articles_raw.csv"), index=False)
+    articles_df.to_csv(raw_articles_path, index=False)
     log.info("✓ Raw articles saved -> %d rows", len(articles_df))
 
     # ── Score with FinBERT ────────────────────────────────────────────────────
     score_df    = FinBERTScorer(model_name=news_cfg["finbert_model"]).score(articles_df["title"].tolist())
     articles_df = pd.concat([articles_df.reset_index(drop=True), score_df.reset_index(drop=True)], axis=1)
-    articles_df.to_csv(os.path.join(processed_dir, "articles_scored.csv"), index=False)
+    articles_df.to_csv(scored_path, index=False)
     log.info("✓ Scored articles saved -> %d rows", len(articles_df))
 
     # ── Align + aggregate ─────────────────────────────────────────────────────
@@ -538,6 +556,9 @@ def run(cfg=None, trading_dates=None):
     sentiment_daily.to_csv(sentiment_path, index=False)
     log.info("✓ Daily sentiment saved -> %s  (%d rows, %.1f MB)",
              sentiment_path, len(sentiment_daily), os.path.getsize(sentiment_path) / 1e6)
+
+    # ── Push updated CSVs to GitHub ───────────────────────────────────────────
+    _push_to_github([raw_articles_path, scored_path, sentiment_path], start, end)
 
     return sentiment_daily
 
