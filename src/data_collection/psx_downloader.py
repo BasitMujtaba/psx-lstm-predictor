@@ -10,7 +10,7 @@ Saves:
   data/processed/psx_prices_processed.csv     <- raw cols + all indicators
 """
 
-import os, asyncio, logging, warnings
+import os, asyncio, logging, warnings, subprocess
 import numpy as np
 import pandas as pd
 import aiohttp
@@ -67,6 +67,21 @@ def _cache_valid(path, start, end):
     df = pd.read_csv(path, parse_dates=["date"])
     return (str(df["date"].min().date()) <= start and
             str(df["date"].max().date()) >= end)
+
+
+def _push_to_github(raw_path, processed_path, start, end):
+    try:
+        cmds = [
+            ["git", "-C", PROJECT_ROOT, "add", raw_path, processed_path],
+            ["git", "-C", PROJECT_ROOT, "commit", "-m",
+             f"Update PSX prices cache {start} -> {end}"],
+            ["git", "-C", PROJECT_ROOT, "push"],
+        ]
+        for cmd in cmds:
+            subprocess.run(cmd, check=True, capture_output=True)
+        log.info("✅ Pushed updated CSVs to GitHub")
+    except subprocess.CalledProcessError as e:
+        log.warning("⚠️ GitHub push failed: %s", e.stderr.decode())
 
 
 def _clean_ticker(ticker: str) -> str:
@@ -293,16 +308,18 @@ def run(cfg=None):
     end            = cfg["data"]["end_date"]
     raw_dir        = _resolve(cfg["data"]["raw_prices_dir"])
     processed_dir  = _resolve(cfg["data"]["processed_dir"])
-    raw_path       = os.path.join(raw_dir,        "psx_prices_raw.csv")
-    processed_path = os.path.join(processed_dir,  "psx_prices_processed.csv")
+    raw_path       = os.path.join(raw_dir,       "psx_prices_raw.csv")
+    processed_path = os.path.join(processed_dir, "psx_prices_processed.csv")
 
     os.makedirs(raw_dir,       exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
+    # ── Cache check ───────────────────────────────────────────────────────────
     if _cache_valid(processed_path, start, end):
         log.info("✅ Cache valid — loading processed prices from disk")
         return pd.read_csv(processed_path, parse_dates=["date"])
 
+    # ── Fetch + save raw ──────────────────────────────────────────────────────
     raw_df, failed = fetch_psx_prices(tickers, start, end)
     if failed:
         log.warning("Tickers with no data: %s", failed)
@@ -310,10 +327,14 @@ def run(cfg=None):
     log.info("✓ Raw saved -> %s  (%d rows, %.1f MB)",
              raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
 
+    # ── Add indicators + save processed ──────────────────────────────────────
     processed_df = add_technical_indicators(raw_df)
     processed_df.to_csv(processed_path, index=False)
     log.info("✓ Processed saved -> %s  (%d rows, %.1f MB)",
              processed_path, len(processed_df), os.path.getsize(processed_path) / 1e6)
+
+    # ── Push updated CSVs to GitHub ───────────────────────────────────────────
+    _push_to_github(raw_path, processed_path, start, end)
 
     return processed_df
 
