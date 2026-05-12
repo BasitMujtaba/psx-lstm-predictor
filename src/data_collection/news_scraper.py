@@ -20,6 +20,11 @@ Date alignment:
 Relevance filtering:
   - Every article title must contain at least one Pakistan/PSX anchor
   - Irrelevant articles are dropped before FinBERT scoring
+
+Caching (3 levels):
+  1. news_sentiment_daily.csv exists -> load and return immediately
+  2. articles_scored.csv exists      -> skip scraping + FinBERT, re-aggregate only
+  3. Neither exists                  -> full pipeline from scratch
 """
 
 import os, asyncio, logging, hashlib, warnings, sys, subprocess
@@ -526,12 +531,19 @@ def aggregate_daily_sentiment(df, start, end, trading_dates):
     full_idx = pd.date_range(start=start, end=end, freq="D")
     daily    = daily.set_index("date").reindex(full_idx)
     daily.index.name = "date"
-    daily["sentiment_score"] = daily["sentiment_score"].ffill().fillna(0.0)
-    daily["sentiment_label"] = daily["sentiment_label"].ffill().fillna("neutral")
+
+    # ── has_news flag before filling ─────────────────────────────────────────
+    daily["has_news"] = (daily["article_count"] > 0).fillna(False)
+
+    # forward-fill max 1 day then reset to neutral/0.0
+    daily["sentiment_score"] = daily["sentiment_score"].ffill(limit=1).fillna(0.0)
+    daily["sentiment_label"] = daily["sentiment_label"].ffill(limit=1).fillna("neutral")
+
     for col in ("article_count", "positive_count", "negative_count", "neutral_count"):
         daily[col] = daily[col].fillna(0).astype(int)
     for cat in QUERY_CATEGORIES:
-        daily[f"{cat}_score"] = daily[f"{cat}_score"].ffill().fillna(0.0)
+        daily[f"{cat}_score"] = daily[f"{cat}_score"].ffill(limit=1).fillna(0.0)
+
     return daily.reset_index()
 
 
@@ -553,31 +565,37 @@ def run(cfg=None, trading_dates=None):
     os.makedirs(raw_news_dir,  exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
-    # ── Cache check ───────────────────────────────────────────────────────────
-    if _cache_valid(sentiment_path):
-        log.info("✅ Cache valid — loading sentiment from disk")
-        return pd.read_csv(sentiment_path, parse_dates=["date"])
-
-    # ── Collect articles ──────────────────────────────────────────────────────
-    articles_df = collect_all_articles(
-        start         = start,
-        end           = end,
-        chunk_months  = news_cfg.get("chunk_months", 3),
-        max_per_chunk = news_cfg.get("max_per_chunk", 5),
-        concurrency   = news_cfg.get("concurrency", 50),
-    )
-    articles_df.to_csv(raw_articles_path, index=False)
-    log.info("✓ Raw articles saved -> %d rows", len(articles_df))
-
-    # ── Score with FinBERT ────────────────────────────────────────────────────
-    score_df    = FinBERTScorer(model_name=news_cfg["finbert_model"]).score(articles_df["title"].tolist())
-    articles_df = pd.concat([articles_df.reset_index(drop=True), score_df.reset_index(drop=True)], axis=1)
-    articles_df.to_csv(scored_path, index=False)
-    log.info("✓ Scored articles saved -> %d rows", len(articles_df))
-
-    # ── Align + aggregate ─────────────────────────────────────────────────────
     if trading_dates is None:
         trading_dates = pd.date_range(start=start, end=end, freq="B")
+
+    # ── Level 1 cache: final sentiment CSV ───────────────────────────────────
+    if _cache_valid(sentiment_path):
+        log.info("✅ Level 1 cache hit — loading sentiment from disk")
+        return pd.read_csv(sentiment_path, parse_dates=["date"])
+
+    # ── Level 2 cache: scored articles CSV ───────────────────────────────────
+    if _cache_valid(scored_path):
+        log.info("✅ Level 2 cache hit — scored articles found, skipping scrape + FinBERT")
+        articles_df = pd.read_csv(scored_path, parse_dates=["date"])
+    else:
+        # ── Level 3: full pipeline from scratch ──────────────────────────────
+        log.info("No cache found — running full pipeline")
+        articles_df = collect_all_articles(
+            start         = start,
+            end           = end,
+            chunk_months  = news_cfg.get("chunk_months", 3),
+            max_per_chunk = news_cfg.get("max_per_chunk", 5),
+            concurrency   = news_cfg.get("concurrency", 50),
+        )
+        articles_df.to_csv(raw_articles_path, index=False)
+        log.info("✓ Raw articles saved -> %d rows", len(articles_df))
+
+        score_df    = FinBERTScorer(model_name=news_cfg["finbert_model"]).score(articles_df["title"].tolist())
+        articles_df = pd.concat([articles_df.reset_index(drop=True), score_df.reset_index(drop=True)], axis=1)
+        articles_df.to_csv(scored_path, index=False)
+        log.info("✓ Scored articles saved -> %d rows", len(articles_df))
+
+    # ── Align + aggregate (always runs if sentiment CSV missing) ──────────────
     articles_df     = align_to_trading_days(articles_df, trading_dates)
     sentiment_daily = aggregate_daily_sentiment(articles_df, start, end, trading_dates)
     sentiment_daily.to_csv(sentiment_path, index=False)
