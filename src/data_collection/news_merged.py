@@ -55,7 +55,6 @@ CATEGORY_MAP = {
 }
 
 # ── Irrelevance Filter — Substring ────────────────────────────────────────────
-# Titles containing ANY of these phrases (case-insensitive) will be dropped
 IRRELEVANT_KEYWORDS = [
     # Foreign currencies
     "yuan", "renminbi", "ringgit", "baht", "peso",
@@ -67,10 +66,20 @@ IRRELEVANT_KEYWORDS = [
     "s&p 500", "nasdaq", "wall street",
     "us federal reserve", "european central bank",
 
+    # UK / Brexit
+    "brexit", "uk budget", "uk economy", "uk inflation",
+    "bank of england", "theresa may", "boris johnson",
+
+    # Specific exports not relevant to PSX
+    "cutlery export", "cutlery import",
+    "surgical export", "surgical instrument",
+    "sports goods export", "leather export",
+
     # Other irrelevant geographies
     "bangladesh", "sri lanka", "myanmar", "vietnam",
     "latin america", "brazil ", "argentina ",
     "turkey inflation", "iran sanction",
+    "afghanistan ", "african ",
 
     # Sports (misclassified articles common in dawn/brecorder)
     "hat-trick", "hat trick", "wicket", "century puts",
@@ -81,26 +90,41 @@ IRRELEVANT_KEYWORDS = [
 ]
 
 # ── Irrelevance Filter — Regex (word boundary) ────────────────────────────────
-# Catches all forms: "India", "India's", "in India", "India," etc.
-# \b ensures "indiana" or "indicate" are NOT matched
 IRRELEVANT_REGEX = [
-    r"\bindia\b",          # India / India's / in India / India, — all forms
-    r"\bindian\b",         # Indian rupee, Indian economy etc
-    r"\bmodi\b",           # Indian PM
-    r"\bnew delhi\b",      # Indian capital
-    r"\brbi\b",            # Reserve Bank of India
+    # India
+    r"\bindia\b",           # India / India's / in India / India, — all forms
+    r"\bindian\b",          # Indian rupee, Indian economy etc
+    r"\bmodi\b",            # Indian PM
+    r"\bnew delhi\b",       # Indian capital
+    r"\brbi\b",             # Reserve Bank of India
+
+    # UK / Europe
+    r"\buk\b",              # UK budget, UK economy — word boundary avoids "bulk"
+    r"\bbrexit\b",
+    r"\bpound\b",           # pound extends, pound falls — avoids "compound"
+    r"\bsterling\b",
+    r"\beuro\b",
+    r"\beuros\b",
+    r"\becb\b",             # European Central Bank
+
+    # US
+    r"\bfederal reserve\b",
+    r"\bwall street\b",
+
+    # Asia / Other foreign
     r"\bsensex\b",
     r"\bnifty\b",
-    r"\byen\b",            # Japanese yen
-    r"\beuro\b",           # Euro currency
-    r"\bwon\b",            # Korean won
+    r"\byen\b",             # Japanese yen — avoids "yen" in other contexts
+    r"\bwon\b",             # Korean won
+    r"\byuan\b",
+    r"\bchina\b",           # China economy/trade not PSX relevant
+    r"\bchinese\b",
 ]
 
 
 # ── Standardize Category ──────────────────────────────────────────────────────
 def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
     # Mettis stores category as "economy" and real category in subcategory
-    # If subcategory column exists, use it as the category source
     if "subcategory" in df.columns:
         df["category"] = df["subcategory"].fillna(df["category"])
 
@@ -108,7 +132,7 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
         df["category"]
         .str.strip()
         .str.lower()
-        .map(CATEGORY_MAP)          # unmapped values become NaN
+        .map(CATEGORY_MAP)
     )
 
     before = len(df)
@@ -191,18 +215,40 @@ def merge_news() -> pd.DataFrame:
 def sanity_check(df: pd.DataFrame) -> None:
     print("\n🔍 Sanity Check:")
 
-    # Check no India articles leaked
-    india_leak = df[df["title"].str.lower().str.contains(r"\bindia\b", regex=True, na=False)]
-    print(f"   India articles remaining  : {len(india_leak):,}  ✅" if len(india_leak) == 0
-          else f"   ⚠️  India articles leaked   : {len(india_leak):,}")
+    checks = {
+        "India articles"  : r"\bindia\b",
+        "Indian articles" : r"\bindian\b",
+        "UK articles"     : r"\buk\b",
+        "Brexit articles" : r"\bbrexit\b",
+        "Pound articles"  : r"\bpound\b",
+        "China articles"  : r"\bchina\b",
+        "Euro articles"   : r"\beuro\b",
+    }
+
+    all_clear = True
+    for label, pattern in checks.items():
+        leaked = df[df["title"].str.lower().str.contains(pattern, regex=True, na=False)]
+        if len(leaked) > 0:
+            print(f"   ⚠️  {label} leaked     : {len(leaked):,}")
+            print(leaked["title"].head(3).to_string())
+            all_clear = False
+        else:
+            print(f"   ✅ {label:<20}: 0")
 
     # Check only 4 categories exist
-    cats = df["category"].unique().tolist()
-    print(f"   Unique categories         : {sorted(cats)}")
+    cats = sorted(df["category"].unique().tolist())
+    expected = ["corporate", "energy", "forex", "macro"]
+    if cats == expected:
+        print(f"   ✅ Categories               : {cats}")
+    else:
+        print(f"   ⚠️  Unexpected categories   : {cats}")
 
     # Check sources
-    sources = df["source"].unique().tolist()
-    print(f"   Unique sources            : {sorted(sources)}")
+    sources = sorted(df["source"].unique().tolist())
+    print(f"   ✅ Sources                  : {sources}")
+
+    if all_clear:
+        print("\n   ✅ All checks passed")
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
