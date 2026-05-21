@@ -12,3 +12,4 @@ matplotlib
 joblib
 playwright
 asyncio
+httpx
