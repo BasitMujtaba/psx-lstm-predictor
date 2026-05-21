@@ -6,6 +6,7 @@
           keeping only: date | category | title | source
           Categories are standardized to 4 values:
             macro | corporate | energy | forex
+          Rows are sorted by date across all sources
  Output : data/processed/news_merged.csv
 ================================================================================
 """
@@ -29,28 +30,28 @@ OUTPUT_PATH = PROCESSED / "news_merged.csv"
 # Any value not listed here → NaN → row dropped
 CATEGORY_MAP = {
     # macro
-    "macro"             : "macro",
-    "fiscal"            : "macro",
-    "monetary"          : "macro",
-    "market_political"  : "macro",
-    "macro|monetary"    : "macro",
-    "macro|fiscal"      : "macro",
+    "macro"                : "macro",
+    "fiscal"               : "macro",
+    "monetary"             : "macro",
+    "market_political"     : "macro",
+    "macro|monetary"       : "macro",
+    "macro|fiscal"         : "macro",
 
     # corporate
-    "corporates"        : "corporate",
-    "banking"           : "corporate",
-    "equities"          : "corporate",
-    "energy|banking"    : "corporate",
-    "equities|forex"    : "corporate",
+    "corporates"           : "corporate",
+    "banking"              : "corporate",
+    "equities"             : "corporate",
+    "energy|banking"       : "corporate",
+    "equities|forex"       : "corporate",
     "equities|commodities" : "corporate",
 
     # energy
-    "energy"            : "energy",
-    "commodities"       : "energy",
-    "fiscal|energy"     : "energy",
+    "energy"               : "energy",
+    "commodities"          : "energy",
+    "fiscal|energy"        : "energy",
 
     # forex
-    "forex"             : "forex",
+    "forex"                : "forex",
 }
 
 # ── Standardize Category ──────────────────────────────────────────────────────
@@ -99,8 +100,8 @@ def merge_news() -> pd.DataFrame:
 
     merged = pd.concat(dfs, ignore_index=True)
 
-    # Standardize date
-    merged["date"] = pd.to_datetime(merged["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    # Convert to datetime before sorting
+    merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
 
     # Drop rows with missing date or title
     before = len(merged)
@@ -109,7 +110,13 @@ def merge_news() -> pd.DataFrame:
     if dropped:
         print(f"🗑️  Dropped {dropped:,} rows with null date/title")
 
+    # Sort by date across all sources
+    merged.sort_values("date", inplace=True)
     merged.reset_index(drop=True, inplace=True)
+
+    # Format date after sorting
+    merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
+
     return merged
 
 
