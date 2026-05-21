@@ -7,6 +7,7 @@
           Categories are standardized to 4 values:
             macro | corporate | energy | forex
           Rows are sorted by date across all sources
+          Irrelevant non-Pakistan articles are filtered out
  Output : data/processed/news_merged.csv
 ================================================================================
 """
@@ -27,7 +28,6 @@ NEWS_FILES = {
 OUTPUT_PATH = PROCESSED / "news_merged.csv"
 
 # ── Category Mapping ──────────────────────────────────────────────────────────
-# Any value not listed here → NaN → row dropped
 CATEGORY_MAP = {
     # macro
     "macro"                : "macro",
@@ -54,10 +54,39 @@ CATEGORY_MAP = {
     "forex"                : "forex",
 }
 
+# ── Irrelevance Filter ────────────────────────────────────────────────────────
+# Titles containing ANY of these phrases (case-insensitive) will be dropped.
+# These are foreign market / sports / non-Pakistan articles that add no signal
+# for Pakistani stock market prediction.
+IRRELEVANT_KEYWORDS = [
+    # Foreign currencies
+    "indian rupee", "india rupee", "yuan", "renminbi", "yen ", "won ",
+    "ringgit", "baht", "peso", "lira", "rand", "ruble", "shekel",
+    "euro ", "sterling", "pound sterling",
+
+    # Foreign markets / indices
+    "sensex", "nifty", "bse ", "nse india", "bombay stock",
+    "shanghai", "hang seng", "nikkei", "ftse", "dow jones",
+    "s&p 500", "nasdaq", "wall street", "fed reserve",
+    "us federal reserve", "european central bank",
+
+    # Sports (misclassified articles common in dawn/brecorder)
+    "hat-trick", "hat trick", "wicket", "century puts",
+    "innings", "thrash", "outplay", "beat ", " won ",
+    "football", "cricket match", "ppfl", "krl", "wapda",
+    "pia beat", "nbp beat", "hbl beat", "ztbl", "kpt score",
+    "navy thrash", "paf beat", "army thrash", "ssgc beat",
+    "kesc crush", "scores hat", "slams hat",
+
+    # Other irrelevant geographies
+    "indian economy", "india gdp", "india inflation",
+    "bangladesh", "sri lanka", "myanmar", "vietnam",
+    "african ", "latin america", "brazil ", "argentina ",
+    "turkey inflation", "iran sanction",
+]
+
 # ── Standardize Category ──────────────────────────────────────────────────────
 def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
-    # Mettis stores category as "economy" and real category in subcategory
-    # If subcategory column exists, use it as the category source
     if "subcategory" in df.columns:
         df["category"] = df["subcategory"].fillna(df["category"])
 
@@ -65,7 +94,7 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
         df["category"]
         .str.strip()
         .str.lower()
-        .map(CATEGORY_MAP)          # unmapped values become NaN
+        .map(CATEGORY_MAP)
     )
 
     before = len(df)
@@ -73,6 +102,25 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
     dropped = before - len(df)
     if dropped:
         print(f"   🗑️  Dropped {dropped:,} rows with unmapped category")
+
+    return df
+
+
+# ── Irrelevance Filter ────────────────────────────────────────────────────────
+def filter_irrelevant(df: pd.DataFrame) -> pd.DataFrame:
+    title_lower = df["title"].str.lower()
+
+    # Build a single mask: True = irrelevant (contains any blacklisted keyword)
+    mask_irrelevant = pd.Series(False, index=df.index)
+    for keyword in IRRELEVANT_KEYWORDS:
+        mask_irrelevant |= title_lower.str.contains(keyword, na=False)
+
+    before  = len(df)
+    df      = df[~mask_irrelevant].copy()
+    dropped = before - len(df)
+
+    if dropped:
+        print(f"   🚫 Dropped {dropped:,} irrelevant articles (foreign/sports)")
 
     return df
 
@@ -90,6 +138,7 @@ def merge_news() -> pd.DataFrame:
         df["source"] = source
 
         df = standardize_category(df)
+        df = filter_irrelevant(df)         # ← filter after category clean
 
         df = df[["date", "category", "title", "source"]]
         dfs.append(df)
