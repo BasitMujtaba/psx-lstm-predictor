@@ -14,3 +14,5 @@ playwright
 asyncio
 httpx
 nest_asyncio
+selenium
+webdriver-manager
