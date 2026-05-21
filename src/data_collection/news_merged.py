@@ -59,8 +59,17 @@ CATEGORY_MAP = {
 # These are foreign market / sports / non-Pakistan articles that add no signal
 # for Pakistani stock market prediction.
 IRRELEVANT_KEYWORDS = [
+    # ── India (broad catch) ───────────────────────────────────────────────────
+    "india ",                  # catches: india pulls, india tries, india gdp etc
+    "india's ",                # catches: india's economy, india's rupee etc
+    "indian ",                 # catches: indian rupee, indian economy etc
+    "modi ",                   # indian PM news
+    "new delhi",
+    "reserve bank of india",
+    "rbi ",
+
     # Foreign currencies
-    "indian rupee", "india rupee", "yuan", "renminbi", "yen ", "won ",
+    "yuan", "renminbi", "yen ", "won ",
     "ringgit", "baht", "peso", "lira", "rand", "ruble", "shekel",
     "euro ", "sterling", "pound sterling",
 
@@ -72,14 +81,13 @@ IRRELEVANT_KEYWORDS = [
 
     # Sports (misclassified articles common in dawn/brecorder)
     "hat-trick", "hat trick", "wicket", "century puts",
-    "innings", "thrash", "outplay", "beat ", " won ",
+    "innings", "thrash", "outplay",
     "football", "cricket match", "ppfl", "krl", "wapda",
     "pia beat", "nbp beat", "hbl beat", "ztbl", "kpt score",
     "navy thrash", "paf beat", "army thrash", "ssgc beat",
     "kesc crush", "scores hat", "slams hat",
 
     # Other irrelevant geographies
-    "indian economy", "india gdp", "india inflation",
     "bangladesh", "sri lanka", "myanmar", "vietnam",
     "african ", "latin america", "brazil ", "argentina ",
     "turkey inflation", "iran sanction",
