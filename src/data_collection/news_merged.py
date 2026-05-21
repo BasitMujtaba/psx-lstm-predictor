@@ -3,17 +3,22 @@
  File   : src/data_collection/news_merged.py
  Project: PSX LSTM Predictor
  Purpose: Merge news from Dawn, BRecorder, and Mettis into a single CSV
-          keeping only: date | category | title | source
+          keeping only: date | category | title | source | sentiment_score
           Categories are standardized to 4 values:
             macro | corporate | energy | forex
           Rows are sorted by date across all sources
           Irrelevant non-Pakistan articles are filtered out
+          Sentiment scored using FinBERT (GPU if available else CPU)
  Output : data/processed/news_merged.csv
 ================================================================================
 """
 
 import pandas as pd
+import torch
 from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.nn.functional import softmax
+from tqdm import tqdm
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).resolve().parents[2]
@@ -26,6 +31,9 @@ NEWS_FILES = {
 }
 
 OUTPUT_PATH = PROCESSED / "news_merged.csv"
+
+FINBERT_MODEL = "ProsusAI/finbert"
+BATCH_SIZE    = 32
 
 # ── Category Mapping ──────────────────────────────────────────────────────────
 CATEGORY_MAP = {
@@ -81,7 +89,7 @@ IRRELEVANT_KEYWORDS = [
     "turkey inflation", "iran sanction",
     "afghanistan ", "african ",
 
-    # Sports (misclassified articles common in dawn/brecorder)
+    # Sports
     "hat-trick", "hat trick", "wicket", "century puts",
     "innings", "thrash", "outplay", "ppfl", "krl", "wapda",
     "pia beat", "nbp beat", "hbl beat", "ztbl", "kpt score",
@@ -92,20 +100,20 @@ IRRELEVANT_KEYWORDS = [
 # ── Irrelevance Filter — Regex (word boundary) ────────────────────────────────
 IRRELEVANT_REGEX = [
     # India
-    r"\bindia\b",           # India / India's / in India / India, — all forms
-    r"\bindian\b",          # Indian rupee, Indian economy etc
-    r"\bmodi\b",            # Indian PM
-    r"\bnew delhi\b",       # Indian capital
-    r"\brbi\b",             # Reserve Bank of India
+    r"\bindia\b",
+    r"\bindian\b",
+    r"\bmodi\b",
+    r"\bnew delhi\b",
+    r"\brbi\b",
 
     # UK / Europe
-    r"\buk\b",              # UK budget, UK economy — word boundary avoids "bulk"
+    r"\buk\b",
     r"\bbrexit\b",
-    r"\bpound\b",           # pound extends, pound falls — avoids "compound"
+    r"\bpound\b",
     r"\bsterling\b",
     r"\beuro\b",
     r"\beuros\b",
-    r"\becb\b",             # European Central Bank
+    r"\becb\b",
 
     # US
     r"\bfederal reserve\b",
@@ -114,17 +122,16 @@ IRRELEVANT_REGEX = [
     # Asia / Other foreign
     r"\bsensex\b",
     r"\bnifty\b",
-    r"\byen\b",             # Japanese yen — avoids "yen" in other contexts
-    r"\bwon\b",             # Korean won
+    r"\byen\b",
+    r"\bwon\b",
     r"\byuan\b",
-    r"\bchina\b",           # China economy/trade not PSX relevant
+    r"\bchina\b",
     r"\bchinese\b",
 ]
 
 
 # ── Standardize Category ──────────────────────────────────────────────────────
 def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
-    # Mettis stores category as "economy" and real category in subcategory
     if "subcategory" in df.columns:
         df["category"] = df["subcategory"].fillna(df["category"])
 
@@ -148,12 +155,10 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
 def filter_irrelevant(df: pd.DataFrame) -> pd.DataFrame:
     title_lower = df["title"].str.lower()
 
-    # Simple substring match
     mask = pd.Series(False, index=df.index)
     for keyword in IRRELEVANT_KEYWORDS:
         mask |= title_lower.str.contains(keyword, na=False)
 
-    # Regex word boundary match
     for pattern in IRRELEVANT_REGEX:
         mask |= title_lower.str.contains(pattern, regex=True, na=False)
 
@@ -163,6 +168,83 @@ def filter_irrelevant(df: pd.DataFrame) -> pd.DataFrame:
 
     if dropped:
         print(f"   🚫 Dropped {dropped:,} irrelevant articles (foreign/sports)")
+
+    return df
+
+
+# ── FinBERT Sentiment Scoring ─────────────────────────────────────────────────
+def load_finbert(device: torch.device):
+    print(f"\n🤖 Loading FinBERT on {device} ...")
+    tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
+    model     = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
+    model.to(device)
+    model.eval()
+    print(f"   ✅ FinBERT loaded")
+    return tokenizer, model
+
+
+def compute_sentiment(
+    titles: list,
+    tokenizer,
+    model,
+    device: torch.device,
+) -> list:
+    """
+    Returns a sentiment score per title in range [-1, +1]:
+        +1  = strong positive
+         0  = neutral
+        -1  = strong negative
+
+    FinBERT output labels: positive / negative / neutral
+    Score = P(positive) - P(negative)
+    Neutral articles get a score close to 0.
+    """
+    scores = []
+
+    for i in tqdm(range(0, len(titles), BATCH_SIZE), desc="   Scoring"):
+        batch = titles[i : i + BATCH_SIZE]
+
+        encoded = tokenizer(
+            batch,
+            padding=True,
+            truncation=True,
+            max_length=128,
+            return_tensors="pt",
+        ).to(device)
+
+        with torch.no_grad():
+            logits = model(**encoded).logits
+
+        probs = softmax(logits, dim=1).cpu()
+
+        # FinBERT label order: positive=0, negative=1, neutral=2
+        pos = probs[:, 0]
+        neg = probs[:, 1]
+
+        batch_scores = (pos - neg).tolist()
+        scores.extend(batch_scores)
+
+    return scores
+
+
+def add_sentiment(df: pd.DataFrame) -> pd.DataFrame:
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer, model = load_finbert(device)
+
+    print(f"\n📊 Computing sentiment for {len(df):,} articles ...")
+    titles = df["title"].fillna("").tolist()
+    scores = compute_sentiment(titles, tokenizer, model, device)
+
+    df["sentiment_score"] = [round(s, 4) for s in scores]
+
+    print(f"   ✅ Sentiment scoring complete")
+    print(f"   Score range : {df['sentiment_score'].min():.4f} → {df['sentiment_score'].max():.4f}")
+    print(f"   Mean score  : {df['sentiment_score'].mean():.4f}")
+
+    # Free GPU memory
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     return df
 
@@ -208,6 +290,9 @@ def merge_news() -> pd.DataFrame:
     # Format date after sorting
     merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
 
+    # Add FinBERT sentiment score
+    merged = add_sentiment(merged)
+
     return merged
 
 
@@ -236,12 +321,22 @@ def sanity_check(df: pd.DataFrame) -> None:
             print(f"   ✅ {label:<20}: 0")
 
     # Check only 4 categories exist
-    cats = sorted(df["category"].unique().tolist())
+    cats     = sorted(df["category"].unique().tolist())
     expected = ["corporate", "energy", "forex", "macro"]
     if cats == expected:
         print(f"   ✅ Categories               : {cats}")
     else:
         print(f"   ⚠️  Unexpected categories   : {cats}")
+
+    # Check sentiment_score column exists and has no nulls
+    if "sentiment_score" in df.columns:
+        nulls = df["sentiment_score"].isna().sum()
+        if nulls == 0:
+            print(f"   ✅ sentiment_score          : no nulls, range [{df['sentiment_score'].min():.4f}, {df['sentiment_score'].max():.4f}]")
+        else:
+            print(f"   ⚠️  sentiment_score nulls   : {nulls:,}")
+    else:
+        print(f"   ⚠️  sentiment_score column missing")
 
     # Check sources
     sources = sorted(df["source"].unique().tolist())
@@ -257,17 +352,22 @@ def save_merged(df: pd.DataFrame) -> None:
     df.to_csv(OUTPUT_PATH, index=False)
     print(f"\n💾 Saved → {OUTPUT_PATH}")
     print(f"   Total rows : {len(df):,}")
+    print(f"   Columns    : {df.columns.tolist()}")
     print(f"   Date range : {df['date'].min()} → {df['date'].max()}")
     print("\n📊 Rows per source:")
     print(df["source"].value_counts().to_string())
     print("\n📊 Rows per category:")
     print(df["category"].value_counts().to_string())
+    print("\n📊 Sentiment distribution:")
+    print(f"   Positive (> 0.1)  : {(df['sentiment_score'] >  0.1).sum():,}")
+    print(f"   Neutral  (-0.1–0.1): {((df['sentiment_score'] >= -0.1) & (df['sentiment_score'] <= 0.1)).sum():,}")
+    print(f"   Negative (< -0.1) : {(df['sentiment_score'] < -0.1).sum():,}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Merging news sources")
+    print("  Merging news sources + FinBERT Sentiment Scoring")
     print("=" * 60)
     df = merge_news()
     save_merged(df)
