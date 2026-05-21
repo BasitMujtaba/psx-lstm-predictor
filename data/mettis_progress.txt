@@ -1,0 +1,11 @@
+economy
+equity
+forex
+company_analysis
+technical
+mg_opinion
+global_business
+native
+press_release
+analyst_briefing
+stock_picks
