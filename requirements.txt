@@ -13,3 +13,4 @@ joblib
 playwright
 asyncio
 httpx
+nest_asyncio
