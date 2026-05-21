@@ -54,47 +54,53 @@ CATEGORY_MAP = {
     "forex"                : "forex",
 }
 
-# ── Irrelevance Filter ────────────────────────────────────────────────────────
-# Titles containing ANY of these phrases (case-insensitive) will be dropped.
-# These are foreign market / sports / non-Pakistan articles that add no signal
-# for Pakistani stock market prediction.
+# ── Irrelevance Filter — Substring ────────────────────────────────────────────
+# Titles containing ANY of these phrases (case-insensitive) will be dropped
 IRRELEVANT_KEYWORDS = [
-    # ── India (broad catch) ───────────────────────────────────────────────────
-    "india ",                  # catches: india pulls, india tries, india gdp etc
-    "india's ",                # catches: india's economy, india's rupee etc
-    "indian ",                 # catches: indian rupee, indian economy etc
-    "modi ",                   # indian PM news
-    "new delhi",
-    "reserve bank of india",
-    "rbi ",
-
     # Foreign currencies
-    "yuan", "renminbi", "yen ", "won ",
-    "ringgit", "baht", "peso", "lira", "rand", "ruble", "shekel",
-    "euro ", "sterling", "pound sterling",
+    "yuan", "renminbi", "ringgit", "baht", "peso",
+    "lira", "rand", "ruble", "shekel", "sterling", "pound sterling",
 
     # Foreign markets / indices
     "sensex", "nifty", "bse ", "nse india", "bombay stock",
     "shanghai", "hang seng", "nikkei", "ftse", "dow jones",
-    "s&p 500", "nasdaq", "wall street", "fed reserve",
+    "s&p 500", "nasdaq", "wall street",
     "us federal reserve", "european central bank",
-
-    # Sports (misclassified articles common in dawn/brecorder)
-    "hat-trick", "hat trick", "wicket", "century puts",
-    "innings", "thrash", "outplay",
-    "football", "cricket match", "ppfl", "krl", "wapda",
-    "pia beat", "nbp beat", "hbl beat", "ztbl", "kpt score",
-    "navy thrash", "paf beat", "army thrash", "ssgc beat",
-    "kesc crush", "scores hat", "slams hat",
 
     # Other irrelevant geographies
     "bangladesh", "sri lanka", "myanmar", "vietnam",
-    "african ", "latin america", "brazil ", "argentina ",
+    "latin america", "brazil ", "argentina ",
     "turkey inflation", "iran sanction",
+
+    # Sports (misclassified articles common in dawn/brecorder)
+    "hat-trick", "hat trick", "wicket", "century puts",
+    "innings", "thrash", "outplay", "ppfl", "krl", "wapda",
+    "pia beat", "nbp beat", "hbl beat", "ztbl", "kpt score",
+    "navy thrash", "paf beat", "army thrash", "ssgc beat",
+    "kesc crush", "scores hat", "slams hat",
 ]
+
+# ── Irrelevance Filter — Regex (word boundary) ────────────────────────────────
+# Catches all forms: "India", "India's", "in India", "India," etc.
+# \b ensures "indiana" or "indicate" are NOT matched
+IRRELEVANT_REGEX = [
+    r"\bindia\b",          # India / India's / in India / India, — all forms
+    r"\bindian\b",         # Indian rupee, Indian economy etc
+    r"\bmodi\b",           # Indian PM
+    r"\bnew delhi\b",      # Indian capital
+    r"\brbi\b",            # Reserve Bank of India
+    r"\bsensex\b",
+    r"\bnifty\b",
+    r"\byen\b",            # Japanese yen
+    r"\beuro\b",           # Euro currency
+    r"\bwon\b",            # Korean won
+]
+
 
 # ── Standardize Category ──────────────────────────────────────────────────────
 def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
+    # Mettis stores category as "economy" and real category in subcategory
+    # If subcategory column exists, use it as the category source
     if "subcategory" in df.columns:
         df["category"] = df["subcategory"].fillna(df["category"])
 
@@ -102,7 +108,7 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
         df["category"]
         .str.strip()
         .str.lower()
-        .map(CATEGORY_MAP)
+        .map(CATEGORY_MAP)          # unmapped values become NaN
     )
 
     before = len(df)
@@ -118,13 +124,17 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
 def filter_irrelevant(df: pd.DataFrame) -> pd.DataFrame:
     title_lower = df["title"].str.lower()
 
-    # Build a single mask: True = irrelevant (contains any blacklisted keyword)
-    mask_irrelevant = pd.Series(False, index=df.index)
+    # Simple substring match
+    mask = pd.Series(False, index=df.index)
     for keyword in IRRELEVANT_KEYWORDS:
-        mask_irrelevant |= title_lower.str.contains(keyword, na=False)
+        mask |= title_lower.str.contains(keyword, na=False)
+
+    # Regex word boundary match
+    for pattern in IRRELEVANT_REGEX:
+        mask |= title_lower.str.contains(pattern, regex=True, na=False)
 
     before  = len(df)
-    df      = df[~mask_irrelevant].copy()
+    df      = df[~mask].copy()
     dropped = before - len(df)
 
     if dropped:
@@ -146,7 +156,7 @@ def merge_news() -> pd.DataFrame:
         df["source"] = source
 
         df = standardize_category(df)
-        df = filter_irrelevant(df)         # ← filter after category clean
+        df = filter_irrelevant(df)
 
         df = df[["date", "category", "title", "source"]]
         dfs.append(df)
@@ -177,6 +187,24 @@ def merge_news() -> pd.DataFrame:
     return merged
 
 
+# ── Sanity Check ──────────────────────────────────────────────────────────────
+def sanity_check(df: pd.DataFrame) -> None:
+    print("\n🔍 Sanity Check:")
+
+    # Check no India articles leaked
+    india_leak = df[df["title"].str.lower().str.contains(r"\bindia\b", regex=True, na=False)]
+    print(f"   India articles remaining  : {len(india_leak):,}  ✅" if len(india_leak) == 0
+          else f"   ⚠️  India articles leaked   : {len(india_leak):,}")
+
+    # Check only 4 categories exist
+    cats = df["category"].unique().tolist()
+    print(f"   Unique categories         : {sorted(cats)}")
+
+    # Check sources
+    sources = df["source"].unique().tolist()
+    print(f"   Unique sources            : {sorted(sources)}")
+
+
 # ── Save ──────────────────────────────────────────────────────────────────────
 def save_merged(df: pd.DataFrame) -> None:
     PROCESSED.mkdir(parents=True, exist_ok=True)
@@ -197,6 +225,7 @@ if __name__ == "__main__":
     print("=" * 60)
     df = merge_news()
     save_merged(df)
+    sanity_check(df)
     print("=" * 60)
     print("  Done")
     print("=" * 60)
