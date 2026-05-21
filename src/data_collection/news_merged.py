@@ -4,6 +4,8 @@
  Project: PSX LSTM Predictor
  Purpose: Merge news from Dawn, BRecorder, and Mettis into a single CSV
           keeping only: date | category | title | source
+          Categories are standardized to 4 values:
+            macro | corporate | energy | forex
  Output : data/processed/news_merged.csv
 ================================================================================
 """
@@ -23,6 +25,57 @@ NEWS_FILES = {
 
 OUTPUT_PATH = PROCESSED / "news_merged.csv"
 
+# ── Category Mapping ──────────────────────────────────────────────────────────
+# Any value not listed here → NaN → row dropped
+CATEGORY_MAP = {
+    # macro
+    "macro"             : "macro",
+    "fiscal"            : "macro",
+    "monetary"          : "macro",
+    "market_political"  : "macro",
+    "macro|monetary"    : "macro",
+    "macro|fiscal"      : "macro",
+
+    # corporate
+    "corporates"        : "corporate",
+    "banking"           : "corporate",
+    "equities"          : "corporate",
+    "energy|banking"    : "corporate",
+    "equities|forex"    : "corporate",
+    "equities|commodities" : "corporate",
+
+    # energy
+    "energy"            : "energy",
+    "commodities"       : "energy",
+    "fiscal|energy"     : "energy",
+
+    # forex
+    "forex"             : "forex",
+}
+
+# ── Standardize Category ──────────────────────────────────────────────────────
+def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
+    # Mettis stores category as "economy" and real category in subcategory
+    # If subcategory column exists, use it as the category source
+    if "subcategory" in df.columns:
+        df["category"] = df["subcategory"].fillna(df["category"])
+
+    df["category"] = (
+        df["category"]
+        .str.strip()
+        .str.lower()
+        .map(CATEGORY_MAP)          # unmapped values become NaN
+    )
+
+    before = len(df)
+    df.dropna(subset=["category"], inplace=True)
+    dropped = before - len(df)
+    if dropped:
+        print(f"   🗑️  Dropped {dropped:,} rows with unmapped category")
+
+    return df
+
+
 # ── Merge ─────────────────────────────────────────────────────────────────────
 def merge_news() -> pd.DataFrame:
     dfs = []
@@ -34,6 +87,9 @@ def merge_news() -> pd.DataFrame:
 
         df = pd.read_csv(path)
         df["source"] = source
+
+        df = standardize_category(df)
+
         df = df[["date", "category", "title", "source"]]
         dfs.append(df)
         print(f"✅ Loaded {len(df):>6,} rows  ← {source}")
@@ -66,6 +122,8 @@ def save_merged(df: pd.DataFrame) -> None:
     print(f"   Date range : {df['date'].min()} → {df['date'].max()}")
     print("\n📊 Rows per source:")
     print(df["source"].value_counts().to_string())
+    print("\n📊 Rows per category:")
+    print(df["category"].value_counts().to_string())
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
