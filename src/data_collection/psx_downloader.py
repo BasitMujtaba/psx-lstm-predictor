@@ -12,6 +12,8 @@ Saves:
 Warmup rows dropped per ticker:
   - First 252 rows dropped (turbulence warmup — longest window)
   - Then any remaining NaNs dropped (rsi, cci, bb_*, dmi_dx, ldcp)
+
+Final CSV sorted by [date, ticker] for clean train/test splits.
 """
 
 import os, asyncio, logging, warnings, subprocess
@@ -317,10 +319,16 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         frames.append(g)
 
     result = pd.concat(frames, ignore_index=True)
+
+    # ── KEY CHANGE: sort ticker-first here (for correct warmup drop per ticker)
     result.sort_values(["ticker", "date"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
     result = _drop_warmup_rows(result)
+
+    # ── KEY CHANGE: re-sort date-first for model training after warmup drop
+    result.sort_values(["date", "ticker"], inplace=True)
+    result.reset_index(drop=True, inplace=True)
 
     indicator_cols = (["macd", "rsi", "cci", "dmi_dx"]
                       + [f"ema_{p}" for p in _EMA_PERIODS]
@@ -357,6 +365,10 @@ def run(cfg=None):
              raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
 
     processed_df = add_technical_indicators(raw_df)
+
+    # ── Final sort confirmation log
+    log.info("Final CSV sorted by [date, ticker] — ready for model training")
+
     processed_df.to_csv(processed_path, index=False)
     log.info("Processed saved -> %s  (%d rows, %.1f MB)",
              processed_path, len(processed_df), os.path.getsize(processed_path) / 1e6)
