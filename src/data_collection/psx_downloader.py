@@ -86,7 +86,7 @@ def _cache_valid(path):
         # ── Auto-fix sort order if needed
         df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
         if not df.equals(df_sorted):
-            log.info("Cache sort order was [ticker, date] — fixing to [date, ticker] and re-saving ...")
+            log.info("Cache sort order was wrong — fixing to [date, ticker] and re-saving ...")
             df_sorted.to_csv(path, index=False)
             log.info("Cache re-saved with correct sort order.")
             return True, df_sorted
@@ -265,8 +265,11 @@ def fetch_psx_prices(tickers, start, end, concurrency=_CONCURRENCY):
     if not valid:
         raise RuntimeError("No data fetched for any ticker.")
     result = pd.concat(valid, ignore_index=True)
-    result.sort_values(["ticker", "date"], inplace=True)
+
+    # ── Sort by [date, ticker] first so raw CSV is date-ordered before any operations
+    result.sort_values(["date", "ticker"], inplace=True)
     result.reset_index(drop=True, inplace=True)
+
     result = _derive_ldcp_change(result)
     log.info("Raw shape: %s | tickers: %d | failed: %d",
              result.shape, result["ticker"].nunique(), len(failed))
@@ -282,6 +285,10 @@ def _turbulence_1d(window):
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     log.info("Computing technical indicators for %d tickers ...", df["ticker"].nunique())
+
+    # ── Ensure input is sorted by [date, ticker] before per-ticker processing
+    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
     frames = []
     for ticker, grp in tqdm(df.groupby("ticker"), desc="Indicators"):
         g                = grp.copy().sort_values("date").reset_index(drop=True)
@@ -334,13 +341,13 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     result = pd.concat(frames, ignore_index=True)
 
-    # ── sort ticker-first for correct warmup drop per ticker
-    result.sort_values(["ticker", "date"], inplace=True)
+    # ── Sort by [date, ticker] before warmup drop so processed CSV is date-ordered
+    result.sort_values(["date", "ticker"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
     result = _drop_warmup_rows(result)
 
-    # ── re-sort date-first for model training after warmup drop
+    # ── Final sort by [date, ticker] — ready for model training
     result.sort_values(["date", "ticker"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
@@ -367,7 +374,6 @@ def run(cfg=None):
     os.makedirs(raw_dir,       exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
-    # ── _cache_valid now returns (bool, df_or_None) and auto-fixes sort order
     is_valid, cached_df = _cache_valid(processed_path)
     if is_valid:
         log.info("Cache valid — returning processed prices (sorted by [date, ticker])")
@@ -376,6 +382,8 @@ def run(cfg=None):
     raw_df, failed = fetch_psx_prices(tickers, start, end)
     if failed:
         log.warning("Tickers with no data: %s", failed)
+
+    # ── Raw CSV saved already sorted by [date, ticker] from fetch_psx_prices
     raw_df.to_csv(raw_path, index=False)
     log.info("Raw saved -> %s  (%d rows, %.1f MB)",
              raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
