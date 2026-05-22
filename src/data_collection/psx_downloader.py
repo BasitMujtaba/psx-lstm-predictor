@@ -69,18 +69,32 @@ def _resolve(cfg_path):
 
 
 def _cache_valid(path):
+    """
+    Returns (is_valid, df_or_None).
+    If cache exists and is valid, also ensures it is sorted by [date, ticker].
+    If sort order was wrong, fixes and re-saves in place before returning.
+    """
     if not os.path.exists(path):
-        return False
+        return False, None
     try:
         df = pd.read_csv(path, parse_dates=["date"])
         if df.empty:
-            return False
+            return False, None
         log.info("Cache hit — CSV covers %s -> %s (%d rows)",
                  df["date"].min().date(), df["date"].max().date(), len(df))
-        return True
+
+        # ── Auto-fix sort order if needed
+        df_sorted = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+        if not df.equals(df_sorted):
+            log.info("Cache sort order was [ticker, date] — fixing to [date, ticker] and re-saving ...")
+            df_sorted.to_csv(path, index=False)
+            log.info("Cache re-saved with correct sort order.")
+            return True, df_sorted
+
+        return True, df
     except Exception as e:
         log.warning("Cache check failed: %s", e)
-        return False
+        return False, None
 
 
 def _push_to_github(raw_path, processed_path, start, end):
@@ -320,13 +334,13 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     result = pd.concat(frames, ignore_index=True)
 
-    # ── KEY CHANGE: sort ticker-first here (for correct warmup drop per ticker)
+    # ── sort ticker-first for correct warmup drop per ticker
     result.sort_values(["ticker", "date"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
     result = _drop_warmup_rows(result)
 
-    # ── KEY CHANGE: re-sort date-first for model training after warmup drop
+    # ── re-sort date-first for model training after warmup drop
     result.sort_values(["date", "ticker"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
@@ -353,9 +367,11 @@ def run(cfg=None):
     os.makedirs(raw_dir,       exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
-    if _cache_valid(processed_path):
-        log.info("Cache valid — loading processed prices from disk")
-        return pd.read_csv(processed_path, parse_dates=["date"])
+    # ── _cache_valid now returns (bool, df_or_None) and auto-fixes sort order
+    is_valid, cached_df = _cache_valid(processed_path)
+    if is_valid:
+        log.info("Cache valid — returning processed prices (sorted by [date, ticker])")
+        return cached_df
 
     raw_df, failed = fetch_psx_prices(tickers, start, end)
     if failed:
@@ -366,9 +382,7 @@ def run(cfg=None):
 
     processed_df = add_technical_indicators(raw_df)
 
-    # ── Final sort confirmation log
     log.info("Final CSV sorted by [date, ticker] — ready for model training")
-
     processed_df.to_csv(processed_path, index=False)
     log.info("Processed saved -> %s  (%d rows, %.1f MB)",
              processed_path, len(processed_df), os.path.getsize(processed_path) / 1e6)
