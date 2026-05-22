@@ -3,7 +3,7 @@
  File   : src/data_collection/news_merged.py
  Project: PSX LSTM Predictor
  Purpose: Merge news from Dawn, BRecorder, and Mettis into a single CSV
-          keeping only: date | category | title | source | sentiment_score
+          keeping only: date | category | title | source | sentiment_score | sentiment_label
           Categories are standardized to 4 values:
             macro | corporate | energy | forex
           Rows are sorted by date across all sources
@@ -195,9 +195,8 @@ def compute_sentiment(
          0  = neutral
         -1  = strong negative
 
-    FinBERT output labels: positive / negative / neutral
+    FinBERT output labels: positive=0, negative=1, neutral=2
     Score = P(positive) - P(negative)
-    Neutral articles get a score close to 0.
     """
     scores = []
 
@@ -217,7 +216,6 @@ def compute_sentiment(
 
         probs = softmax(logits, dim=1).cpu()
 
-        # FinBERT label order: positive=0, negative=1, neutral=2
         pos = probs[:, 0]
         neg = probs[:, 1]
 
@@ -227,8 +225,23 @@ def compute_sentiment(
     return scores
 
 
+def score_to_label(score: float) -> str:
+    """
+    Convert numeric sentiment score to human-readable label.
+        score >  0.1  → positive
+        score < -0.1  → negative
+        otherwise     → neutral
+    """
+    if score > 0.1:
+        return "positive"
+    elif score < -0.1:
+        return "negative"
+    else:
+        return "neutral"
+
+
 def add_sentiment(df: pd.DataFrame) -> pd.DataFrame:
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer, model = load_finbert(device)
 
     print(f"\n📊 Computing sentiment for {len(df):,} articles ...")
@@ -236,6 +249,7 @@ def add_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     scores = compute_sentiment(titles, tokenizer, model, device)
 
     df["sentiment_score"] = [round(s, 4) for s in scores]
+    df["sentiment_label"] = df["sentiment_score"].apply(score_to_label)
 
     print(f"   ✅ Sentiment scoring complete")
     print(f"   Score range : {df['sentiment_score'].min():.4f} → {df['sentiment_score'].max():.4f}")
@@ -290,7 +304,7 @@ def merge_news() -> pd.DataFrame:
     # Format date after sorting
     merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
 
-    # Add FinBERT sentiment score
+    # Add FinBERT sentiment score + label
     merged = add_sentiment(merged)
 
     return merged
@@ -314,33 +328,44 @@ def sanity_check(df: pd.DataFrame) -> None:
     for label, pattern in checks.items():
         leaked = df[df["title"].str.lower().str.contains(pattern, regex=True, na=False)]
         if len(leaked) > 0:
-            print(f"   ⚠️  {label} leaked     : {len(leaked):,}")
+            print(f"   ⚠️  {label} leaked      : {len(leaked):,}")
             print(leaked["title"].head(3).to_string())
             all_clear = False
         else:
-            print(f"   ✅ {label:<20}: 0")
+            print(f"   ✅ {label:<20} : 0")
 
     # Check only 4 categories exist
     cats     = sorted(df["category"].unique().tolist())
     expected = ["corporate", "energy", "forex", "macro"]
     if cats == expected:
-        print(f"   ✅ Categories               : {cats}")
+        print(f"   ✅ Categories                : {cats}")
     else:
-        print(f"   ⚠️  Unexpected categories   : {cats}")
+        print(f"   ⚠️  Unexpected categories    : {cats}")
 
-    # Check sentiment_score column exists and has no nulls
+    # Check sentiment_score
     if "sentiment_score" in df.columns:
         nulls = df["sentiment_score"].isna().sum()
         if nulls == 0:
-            print(f"   ✅ sentiment_score          : no nulls, range [{df['sentiment_score'].min():.4f}, {df['sentiment_score'].max():.4f}]")
+            print(f"   ✅ sentiment_score           : no nulls, range [{df['sentiment_score'].min():.4f}, {df['sentiment_score'].max():.4f}]")
         else:
-            print(f"   ⚠️  sentiment_score nulls   : {nulls:,}")
+            print(f"   ⚠️  sentiment_score nulls    : {nulls:,}")
     else:
         print(f"   ⚠️  sentiment_score column missing")
 
+    # Check sentiment_label
+    if "sentiment_label" in df.columns:
+        nulls  = df["sentiment_label"].isna().sum()
+        labels = sorted(df["sentiment_label"].unique().tolist())
+        if nulls == 0 and set(labels) <= {"positive", "negative", "neutral"}:
+            print(f"   ✅ sentiment_label           : {labels}")
+        else:
+            print(f"   ⚠️  sentiment_label issue     : nulls={nulls}, labels={labels}")
+    else:
+        print(f"   ⚠️  sentiment_label column missing")
+
     # Check sources
     sources = sorted(df["source"].unique().tolist())
-    print(f"   ✅ Sources                  : {sources}")
+    print(f"   ✅ Sources                   : {sources}")
 
     if all_clear:
         print("\n   ✅ All checks passed")
@@ -358,10 +383,13 @@ def save_merged(df: pd.DataFrame) -> None:
     print(df["source"].value_counts().to_string())
     print("\n📊 Rows per category:")
     print(df["category"].value_counts().to_string())
-    print("\n📊 Sentiment distribution:")
-    print(f"   Positive (> 0.1)  : {(df['sentiment_score'] >  0.1).sum():,}")
-    print(f"   Neutral  (-0.1–0.1): {((df['sentiment_score'] >= -0.1) & (df['sentiment_score'] <= 0.1)).sum():,}")
-    print(f"   Negative (< -0.1) : {(df['sentiment_score'] < -0.1).sum():,}")
+    print("\n📊 Sentiment label distribution:")
+    print(df["sentiment_label"].value_counts().to_string())
+    print(f"\n📊 Sentiment score stats:")
+    print(f"   Min    : {df['sentiment_score'].min():.4f}")
+    print(f"   Max    : {df['sentiment_score'].max():.4f}")
+    print(f"   Mean   : {df['sentiment_score'].mean():.4f}")
+    print(f"   Median : {df['sentiment_score'].median():.4f}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
