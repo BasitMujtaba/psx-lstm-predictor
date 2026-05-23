@@ -1,5 +1,5 @@
 """
-src/data_collection/psx_downloader.py
+src/data_collection/psx_scraper.py
 =======================================
 Fetches OHLCV price data for PSX tickers via dps.psx.com.pk,
 derives LDCP / Change / Change(%) from close prices,
@@ -8,6 +8,11 @@ and computes technical indicators.
 Saves:
   data/raw/psx_prices/psx_prices_raw.csv      <- OHLCV + LDCP + Change + Change(%)
   data/processed/psx_prices_processed.csv     <- raw cols + all indicators (warmup rows dropped)
+
+Cache logic:
+  1. If processed CSV exists and is valid  → return it directly (skip everything)
+  2. If raw CSV exists                     → load it, skip downloading, compute indicators
+  3. If neither exists                     → fetch from PSX, save raw, compute indicators
 
 Warmup rows dropped per ticker:
   - First 252 rows dropped (turbulence warmup — longest window)
@@ -97,9 +102,35 @@ def _cache_valid(path):
         return False, None
 
 
+def _raw_cache_valid(path):
+    """
+    Returns (is_valid, df_or_None) for the raw CSV.
+    Raw CSV only needs date + ticker + OHLCV columns to be valid.
+    """
+    if not os.path.exists(path):
+        return False, None
+    try:
+        df = pd.read_csv(path, parse_dates=["date"])
+        if df.empty:
+            return False, None
+        required = ["date", "ticker", "open", "high", "low", "close", "volume"]
+        if not all(c in df.columns for c in required):
+            log.warning("Raw cache missing required columns — will re-fetch")
+            return False, None
+        log.info("Raw cache hit — %s covers %s -> %s (%d rows, %d tickers)",
+                 os.path.basename(path),
+                 df["date"].min().date(), df["date"].max().date(),
+                 len(df), df["ticker"].nunique())
+        return True, df
+    except Exception as e:
+        log.warning("Raw cache check failed: %s", e)
+        return False, None
+
+
 def _push_to_github(raw_path, processed_path, start, end):
     try:
         cmds = [
+            ["git", "-C", PROJECT_ROOT, "pull", "--rebase", "origin", "main"],
             ["git", "-C", PROJECT_ROOT, "add", raw_path, processed_path],
             ["git", "-C", PROJECT_ROOT, "commit", "-m",
              f"Update PSX prices cache {start} -> {end}"],
@@ -266,7 +297,7 @@ def fetch_psx_prices(tickers, start, end, concurrency=_CONCURRENCY):
         raise RuntimeError("No data fetched for any ticker.")
     result = pd.concat(valid, ignore_index=True)
 
-    # ── Sort by [date, ticker] first so raw CSV is date-ordered before any operations
+    # ── Sort by [date, ticker] before any operations
     result.sort_values(["date", "ticker"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
@@ -341,7 +372,7 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     result = pd.concat(frames, ignore_index=True)
 
-    # ── Sort by [date, ticker] before warmup drop so processed CSV is date-ordered
+    # ── Sort by [date, ticker] before warmup drop
     result.sort_values(["date", "ticker"], inplace=True)
     result.reset_index(drop=True, inplace=True)
 
@@ -374,20 +405,37 @@ def run(cfg=None):
     os.makedirs(raw_dir,       exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
+    # ── Step 1: check processed cache first — fastest path
     is_valid, cached_df = _cache_valid(processed_path)
     if is_valid:
-        log.info("Cache valid — returning processed prices (sorted by [date, ticker])")
+        log.info("Processed cache valid — returning directly (sorted by [date, ticker])")
         return cached_df
 
-    raw_df, failed = fetch_psx_prices(tickers, start, end)
-    if failed:
-        log.warning("Tickers with no data: %s", failed)
+    # ── Step 2: check raw cache — skip downloading if raw already exists
+    raw_valid, raw_df = _raw_cache_valid(raw_path)
+    if raw_valid:
+        log.info("Raw cache hit — skipping download, loading from %s", raw_path)
+        log.info("Raw loaded: %d rows | %d tickers | %s -> %s",
+                 len(raw_df), raw_df["ticker"].nunique(),
+                 raw_df["date"].min().date(), raw_df["date"].max().date())
 
-    # ── Raw CSV saved already sorted by [date, ticker] from fetch_psx_prices
-    raw_df.to_csv(raw_path, index=False)
-    log.info("Raw saved -> %s  (%d rows, %.1f MB)",
-             raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
+        # ── Re-derive LDCP/change if columns missing (old raw format)
+        if "ldcp" not in raw_df.columns:
+            log.info("Deriving LDCP + change columns from raw ...")
+            raw_df = _derive_ldcp_change(raw_df)
 
+    else:
+        # ── Step 3: nothing cached — fetch from PSX
+        log.info("No cache found — fetching from PSX ...")
+        raw_df, failed = fetch_psx_prices(tickers, start, end)
+        if failed:
+            log.warning("Tickers with no data: %s", failed)
+
+        raw_df.to_csv(raw_path, index=False)
+        log.info("Raw saved -> %s  (%d rows, %.1f MB)",
+                 raw_path, len(raw_df), os.path.getsize(raw_path) / 1e6)
+
+    # ── Step 4: compute indicators on raw (whether loaded or freshly fetched)
     processed_df = add_technical_indicators(raw_df)
 
     log.info("Final CSV sorted by [date, ticker] — ready for model training")
