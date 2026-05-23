@@ -64,10 +64,6 @@ SENTIMENT_COLS = [
 ]
 
 # ── Category-wise decay factors ───────────────────────────────────────────────
-# corporate : 0.7  — earnings/corporate news — fast reaction
-# energy    : 0.7  — energy prices change daily — fast decay
-# forex     : 0.8  — rupee moves linger 1-2 days longer
-# macro     : 0.85 — SBP/policy news takes longer to digest
 DECAY_FACTORS = {
     "sentiment_corporate" : 0.7,
     "sentiment_energy"    : 0.7,
@@ -137,6 +133,59 @@ IRRELEVANT_REGEX = [
     r"\bwon\b", r"\byuan\b", r"\bchina\b", r"\bchinese\b",
 ]
 
+# ── Pakistan Market Signal — used by contextual filter ───────────────────────
+# If a foreign-country article contains ANY of these, it is Pakistan-relevant → keep
+_PAK_SIGNAL = (
+    r"pakistan|pakist|sbp|pkr|rupee|kse|psx|karachi|islamabad|lahore"
+    r"|fbr|nepra|ogra|pia|cpec|remittance|rda"
+    r"|ecc|pso|ogdc|ptcl|hubco|engro|fauji|lucky|meezan"
+    r"|habib|ubi\b|mcb|nbp|ubl|bahl"
+    r"|balance of payment|bop\b|current account deficit"
+    r"|forex reserves|foreign exchange reserve"
+    r"|pak economy|pak.*export|privatisation.*airport"
+    r"|aurangzeb|ishaq dar|miftah|shaukat tarin|hafeez shaikh|reza baqir"
+)
+
+# ── Contextual / Behavioral Rules ─────────────────────────────────────────────
+# These rules drop articles about a foreign topic ONLY when no Pakistan signal
+# is present in the title, avoiding over-blocking (e.g. Pak-Iran gas pipeline
+# articles should not be dropped just because "iran" appears).
+#
+# Rule structure: (foreign_pattern, optional_extended_pak_signal)
+#   foreign_pattern          — regex matching the foreign subject
+#   optional_extended_signal — extra terms beyond _PAK_SIGNAL (or None)
+#
+_CONTEXTUAL_RULES = [
+    # Turkey domestic news
+    (r"\bturkey\b|\berdogan\b", None),
+
+    # UK / Britain domestic news
+    # Note: \buk\b is already in IRRELEVANT_REGEX but hits broadly;
+    # this catches "Britain" / "British" which the regex list misses
+    (r"\bbritain\b|\bbritish\b", None),
+
+    # Saudi domestic news — extend pak signal with Saudi-specific pak terms
+    (r"\bsaudi\b", r"pak economy|aurangzeb"),
+
+    # US Fed / Wall Street — keep if gold/oil/dollar since those affect PSX
+    (r"\bfederal reserve\b|\bwall street\b|\bfed rate\b|\bfed funds\b",
+     r"gold|oil|dollar|crude|commodity"),
+]
+
+# ── PSL Cricket Sports Filter ─────────────────────────────────────────────────
+# PSL = Pakistan Super League (cricket). Articles about match scores, player
+# picks, etc. are irrelevant to equity prediction. Keep only if the article
+# discusses PSL in a financial/regulatory/market context.
+_PSL_KEEP_SIGNAL  = (
+    r"kse|psx|stock|share|equity|market|invest|rupee|pkr|sbp"
+    r"|pcb|sponsorship|revenue|broadcast|rights"
+)
+
+# ── PPL Football Cups ─────────────────────────────────────────────────────────
+# PPL (Pakistan Petroleum Limited) sponsors Balochistan Football Cup.
+# These are pure sports articles with no market relevance.
+_PPL_FOOTBALL_RE  = r"ppl balochistan football|ppl.*football cup"
+
 
 # ── Standardize Category ──────────────────────────────────────────────────────
 def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
@@ -155,14 +204,52 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Irrelevance Filter ────────────────────────────────────────────────────────
 def filter_irrelevant(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Two-stage filter:
+
+    Stage 1 — Hard blacklist (original)
+      Keywords and regex patterns that unconditionally signal a foreign/
+      irrelevant article (India, China, Sensex, etc.)
+
+    Stage 2 — Contextual rules (new)
+      For countries/topics that appear in BOTH Pakistan-relevant and
+      foreign-only articles (Saudi Arabia, Turkey, Iran, UK, US Fed),
+      drop only when NO Pakistan market signal is present in the title.
+      This preserves articles like "Pak-Saudi $3bn deposit" while dropping
+      "Saudi Aramco IPO".
+
+    Stage 3 — Behavioral patterns (new)
+      PSL cricket match reports and PPL football cup articles.
+    """
     title_lower = df["title"].str.lower()
-    mask = pd.Series(False, index=df.index)
+    drop_mask   = pd.Series(False, index=df.index)
+
+    # ── Stage 1: hard blacklist ───────────────────────────────────────────────
     for keyword in IRRELEVANT_KEYWORDS:
-        mask |= title_lower.str.contains(keyword, na=False)
+        drop_mask |= title_lower.str.contains(keyword, na=False)
     for pattern in IRRELEVANT_REGEX:
-        mask |= title_lower.str.contains(pattern, regex=True, na=False)
+        drop_mask |= title_lower.str.contains(pattern, regex=True, na=False)
+
+    # ── Stage 2: contextual foreign-topic rules ───────────────────────────────
+    for foreign_pat, extra_signal in _CONTEXTUAL_RULES:
+        pak_signal = _PAK_SIGNAL
+        if extra_signal:
+            pak_signal = pak_signal + r"|" + extra_signal
+        is_foreign_topic = title_lower.str.contains(foreign_pat, regex=True, na=False)
+        has_pak_signal   = title_lower.str.contains(pak_signal,  regex=True, na=False)
+        drop_mask |= (is_foreign_topic & ~has_pak_signal)
+
+    # ── Stage 3: behavioural patterns ────────────────────────────────────────
+    # PSL cricket — drop unless financial/regulatory context present
+    is_psl      = title_lower.str.contains(r"\bpsl\b", regex=True, na=False)
+    psl_is_fin  = title_lower.str.contains(_PSL_KEEP_SIGNAL, regex=True, na=False)
+    drop_mask  |= (is_psl & ~psl_is_fin)
+
+    # PPL Balochistan Football Cup
+    drop_mask  |= title_lower.str.contains(_PPL_FOOTBALL_RE, regex=True, na=False)
+
     before  = len(df)
-    df      = df[~mask].copy()
+    df      = df[~drop_mask].copy()
     dropped = before - len(df)
     if dropped:
         print(f"   🚫 Dropped {dropped:,} irrelevant articles (foreign/sports)")
@@ -431,10 +518,18 @@ def sanity_check(df: pd.DataFrame) -> None:
         "UK"     : r"\buk\b",     "Brexit" : r"\bbrexit\b",
         "Pound"  : r"\bpound\b",  "China"  : r"\bchina\b",
         "Euro"   : r"\beuro\b",
+        "PSL sports" : r"\bpsl\b",
     }
     all_clear = True
     for label, pattern in checks.items():
-        leaked = df[df["title"].str.lower().str.contains(pattern, regex=True, na=False)]
+        # PSL: only flag as leak if it has no financial signal
+        if label == "PSL sports":
+            leaked = df[
+                df["title"].str.lower().str.contains(pattern, regex=True, na=False) &
+                ~df["title"].str.lower().str.contains(_PSL_KEEP_SIGNAL, regex=True, na=False)
+            ]
+        else:
+            leaked = df[df["title"].str.lower().str.contains(pattern, regex=True, na=False)]
         if len(leaked):
             print(f"   ⚠️  {label} leaked: {len(leaked):,}")
             all_clear = False
@@ -497,7 +592,6 @@ def save_decay(df: pd.DataFrame) -> None:
 def push_to_github():
     try:
         project_root = str(BASE_DIR)
-        # ── relative paths from repo root — absolute paths silently fail with git -C
         files = [
             "data/processed/news_merged.csv",
             "data/processed/news_aggregated_flags.csv",
