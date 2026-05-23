@@ -16,6 +16,9 @@
 ================================================================================
 """
 
+import os
+import base64
+import requests
 import pandas as pd
 import torch
 from pathlib import Path
@@ -413,6 +416,42 @@ def sanity_check(df: pd.DataFrame) -> None:
         print("\n   ✅ All sanity checks passed")
 
 
+# ── GitHub Publisher ──────────────────────────────────────────────────────────
+def push_to_github(local_path: Path, repo_relative_path: str) -> None:
+    """Push a single file to GitHub via REST API (create or update)."""
+    token = os.environ.get("GITHUB_TOKEN")
+    repo  = os.environ.get("GITHUB_REPO")   # e.g. "yourusername/psx-lstm-predictor"
+
+    if not token or not repo:
+        print(f"   ⚠️  GITHUB_TOKEN or GITHUB_REPO not set — skipping GitHub push for {local_path.name}")
+        return
+
+    url     = f"https://api.github.com/repos/{repo}/contents/{repo_relative_path}"
+    headers = {
+        "Authorization" : f"token {token}",
+        "Accept"        : "application/vnd.github.v3+json",
+    }
+
+    with open(local_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode()
+
+    # Fetch existing SHA if file already exists (required for updates)
+    existing = requests.get(url, headers=headers)
+    payload  = {
+        "message" : f"Auto-publish {local_path.name}",
+        "content" : content_b64,
+    }
+    if existing.status_code == 200:
+        payload["sha"] = existing.json()["sha"]
+
+    response = requests.put(url, headers=headers, json=payload)
+    if response.status_code in (200, 201):
+        action = "Updated" if existing.status_code == 200 else "Created"
+        print(f"   ✅ GitHub → {action} {repo_relative_path}")
+    else:
+        print(f"   ❌ GitHub push failed [{response.status_code}]: {response.json().get('message')}")
+
+
 # ── Save ──────────────────────────────────────────────────────────────────────
 def save_merged(df: pd.DataFrame) -> None:
     PROCESSED.mkdir(parents=True, exist_ok=True)
@@ -426,6 +465,7 @@ def save_merged(df: pd.DataFrame) -> None:
     print(df["category"].value_counts().to_string())
     print("\n📊 Sentiment label distribution:")
     print(df["sentiment_label"].value_counts().to_string())
+    push_to_github(OUTPUT_PATH, f"data/processed/{OUTPUT_PATH.name}")
 
 
 def save_flags(df: pd.DataFrame) -> None:
@@ -435,6 +475,7 @@ def save_flags(df: pd.DataFrame) -> None:
     print(f"   Columns : {df.columns.tolist()}")
     print("\n📊 Nulls per column:")
     print(df.isnull().sum().to_string())
+    push_to_github(FLAGS_PATH, f"data/processed/{FLAGS_PATH.name}")
 
 
 def save_decay(df: pd.DataFrame) -> None:
@@ -447,6 +488,7 @@ def save_decay(df: pd.DataFrame) -> None:
         print(f"   {col}: [{df[col].min():.4f}, {df[col].max():.4f}]  mean={df[col].mean():.4f}")
     print("\n📊 Nulls per column:")
     print(df.isnull().sum().to_string())
+    push_to_github(DECAY_PATH, f"data/processed/{DECAY_PATH.name}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -475,7 +517,7 @@ if __name__ == "__main__":
     save_decay(decay_df)
 
     print("\n" + "=" * 60)
-    print("  Done — 3 CSVs saved:")
+    print("  Done — 3 CSVs saved and pushed to GitHub:")
     print(f"    {OUTPUT_PATH.name}")
     print(f"    {FLAGS_PATH.name}")
     print(f"    {DECAY_PATH.name}")
