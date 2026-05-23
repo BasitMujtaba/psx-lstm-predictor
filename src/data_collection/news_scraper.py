@@ -497,13 +497,16 @@ def save_decay(df: pd.DataFrame) -> None:
 def push_to_github():
     try:
         project_root = str(BASE_DIR)
-        files        = [
-            str(OUTPUT_PATH),
-            str(FLAGS_PATH),
-            str(DECAY_PATH),
+        # ── relative paths from repo root — absolute paths silently fail with git -C
+        files = [
+            "data/processed/news_merged.csv",
+            "data/processed/news_aggregated_flags.csv",
+            "data/processed/news_aggregated_decay_catwise.csv",
         ]
         cmds = [
+            ["git", "-C", project_root, "stash"],
             ["git", "-C", project_root, "pull", "--rebase", "origin", "main"],
+            ["git", "-C", project_root, "stash", "pop"],
             ["git", "-C", project_root, "add"] + files,
         ]
         for cmd in cmds:
