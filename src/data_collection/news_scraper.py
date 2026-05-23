@@ -16,9 +16,6 @@
 ================================================================================
 """
 
-import os
-import base64
-import requests
 import pandas as pd
 import torch
 from pathlib import Path
@@ -36,14 +33,14 @@ NEWS_FILES = {
     "mettis"    : PROCESSED / "mettis_news_processed.csv",
 }
 
-OUTPUT_PATH      = PROCESSED / "news_merged.csv"
-FLAGS_PATH       = PROCESSED / "news_aggregated_flags.csv"
-DECAY_PATH       = PROCESSED / "news_aggregated_decay_catwise.csv"
+OUTPUT_PATH = PROCESSED / "news_merged.csv"
+FLAGS_PATH  = PROCESSED / "news_aggregated_flags.csv"
+DECAY_PATH  = PROCESSED / "news_aggregated_decay_catwise.csv"
 
-FINBERT_MODEL    = "ProsusAI/finbert"
-BATCH_SIZE       = 32
+FINBERT_MODEL  = "ProsusAI/finbert"
+BATCH_SIZE     = 32
 
-SENTIMENT_COLS   = [
+SENTIMENT_COLS = [
     "sentiment_corporate",
     "sentiment_energy",
     "sentiment_forex",
@@ -210,6 +207,19 @@ def add_sentiment(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Merge ─────────────────────────────────────────────────────────────────────
 def merge_news() -> pd.DataFrame:
+    """
+    If news_merged.csv already exists — load and return it directly.
+    Skips FinBERT re-scoring to save time.
+    Re-run with force=True or delete the CSV to re-score from scratch.
+    """
+    if OUTPUT_PATH.exists():
+        print(f"\n✅ Cache hit — loading existing {OUTPUT_PATH.name} ...")
+        df = pd.read_csv(OUTPUT_PATH, parse_dates=["date"])
+        print(f"   Loaded {len(df):,} rows")
+        print(f"   Date range : {df['date'].min().date()} → {df['date'].max().date()}")
+        return df
+
+    print("\n📰 No cache found — merging from source CSVs ...")
     dfs = []
     for source, path in NEWS_FILES.items():
         if not path.exists():
@@ -266,14 +276,12 @@ def _base_aggregate(df: pd.DataFrame) -> pd.DataFrame:
         "macro"     : "sentiment_macro",
     })
 
-    # Ensure all 4 columns exist even if a category had zero articles ever
     for col in SENTIMENT_COLS:
         if col not in agg.columns:
             agg[col] = float("nan")
 
-    # Article count per day
-    news_count = df.groupby("date").size().reset_index(name="news_count")
-    agg        = agg.merge(news_count, on="date", how="left")
+    news_count        = df.groupby("date").size().reset_index(name="news_count")
+    agg               = agg.merge(news_count, on="date", how="left")
     agg["news_count"] = agg["news_count"].fillna(0).astype(int)
 
     agg.sort_values("date", inplace=True)
@@ -293,9 +301,6 @@ def aggregate_flags(df: pd.DataFrame) -> pd.DataFrame:
 
     has_X = 1.0  → real news existed for that category that day
     has_X = 0.0  → no news for that category (sentiment filled with 0.0)
-
-    Model can use has_X to know whether to trust sentiment_X.
-    Missing sentiment filled with 0.0 AFTER flags are set.
     """
     print("\n📊 Building flag aggregation ...")
     agg = _base_aggregate(df)
@@ -307,14 +312,11 @@ def aggregate_flags(df: pd.DataFrame) -> pd.DataFrame:
         "sentiment_macro"     : "has_macro",
     }
 
-    # Set flags BEFORE filling zeros — NaN means no news
     for sent_col, flag_col in flag_map.items():
         agg[flag_col] = agg[sent_col].notna().astype(float)
 
-    # Fill missing sentiment with 0.0 (neutral placeholder)
     agg[SENTIMENT_COLS] = agg[SENTIMENT_COLS].fillna(0.0)
 
-    # Reorder columns cleanly
     col_order = [
         "date",
         "sentiment_corporate", "has_corporate",
@@ -333,7 +335,7 @@ def aggregate_flags(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
-# ── Approach 2 — Category-wise Decay Aggregation ──────────────────────────────
+# ── Approach 2 — Category-wise Decay Aggregation ─────────────────────────────
 def aggregate_decay(df: pd.DataFrame) -> pd.DataFrame:
     """
     One row per calendar day (including weekends) with:
@@ -345,24 +347,18 @@ def aggregate_decay(df: pd.DataFrame) -> pd.DataFrame:
       forex     : 0.8  — rupee moves linger slightly longer
       macro     : 0.85 — SBP/IMF policy news lingers longest
 
-    Real news day    → decay_value = actual FinBERT score (resets signal)
-    No news day      → decay_value = previous_value × decay_factor
-    Signal gone      → approaches 0.0 naturally (genuine neutral = 0.0 is valid)
-
-    Reindexed to full calendar so weekends/holidays are included.
+    Real news day  → decay_value = actual FinBERT score (resets signal)
+    No news day    → decay_value = previous_value × decay_factor
+    Signal gone    → approaches 0.0 naturally (genuine neutral = 0.0 is valid)
     """
     print("\n📊 Building category-wise decay aggregation ...")
     agg = _base_aggregate(df)
 
-    # Reindex to full calendar — handles weekends + market holidays
-    full_dates = pd.date_range(start=agg["date"].min(), end=agg["date"].max(), freq="D")
-    agg        = agg.set_index("date").reindex(full_dates)
+    full_dates     = pd.date_range(start=agg["date"].min(), end=agg["date"].max(), freq="D")
+    agg            = agg.set_index("date").reindex(full_dates)
     agg.index.name = "date"
-
-    # Carry news_count = 0 on reindexed days
     agg["news_count"] = agg["news_count"].fillna(0).astype(int)
 
-    # Apply decay per category
     for col, factor in DECAY_FACTORS.items():
         values = agg[col].copy()
         for i in range(1, len(values)):
@@ -371,7 +367,6 @@ def aggregate_decay(df: pd.DataFrame) -> pd.DataFrame:
         agg[col] = values
         print(f"   {col:<25} decay factor = {factor}")
 
-    # Fill any remaining NaNs at very start of data (before first article)
     agg[SENTIMENT_COLS] = agg[SENTIMENT_COLS].fillna(0.0).round(4)
 
     agg = agg.reset_index()
@@ -382,7 +377,7 @@ def aggregate_decay(df: pd.DataFrame) -> pd.DataFrame:
     real_days  = (agg["news_count"] > 0).sum()
     decay_days = (agg["news_count"] == 0).sum()
     print(f"   ✅ Decay aggregation complete — shape: {agg.shape}")
-    print(f"   📅 Date range : {agg['date'].min().date()} → {agg['date'].max().date()}")
+    print(f"   📅 Date range      : {agg['date'].min().date()} → {agg['date'].max().date()}")
     print(f"   📊 Real news days  : {real_days:,} ({real_days/len(agg)*100:.1f}%)")
     print(f"   📊 Decay-only days : {decay_days:,} ({decay_days/len(agg)*100:.1f}%)")
     return agg
@@ -416,42 +411,6 @@ def sanity_check(df: pd.DataFrame) -> None:
         print("\n   ✅ All sanity checks passed")
 
 
-# ── GitHub Publisher ──────────────────────────────────────────────────────────
-def push_to_github(local_path: Path, repo_relative_path: str) -> None:
-    """Push a single file to GitHub via REST API (create or update)."""
-    token = os.environ.get("GITHUB_TOKEN")
-    repo  = os.environ.get("GITHUB_REPO")   # e.g. "yourusername/psx-lstm-predictor"
-
-    if not token or not repo:
-        print(f"   ⚠️  GITHUB_TOKEN or GITHUB_REPO not set — skipping GitHub push for {local_path.name}")
-        return
-
-    url     = f"https://api.github.com/repos/{repo}/contents/{repo_relative_path}"
-    headers = {
-        "Authorization" : f"token {token}",
-        "Accept"        : "application/vnd.github.v3+json",
-    }
-
-    with open(local_path, "rb") as f:
-        content_b64 = base64.b64encode(f.read()).decode()
-
-    # Fetch existing SHA if file already exists (required for updates)
-    existing = requests.get(url, headers=headers)
-    payload  = {
-        "message" : f"Auto-publish {local_path.name}",
-        "content" : content_b64,
-    }
-    if existing.status_code == 200:
-        payload["sha"] = existing.json()["sha"]
-
-    response = requests.put(url, headers=headers, json=payload)
-    if response.status_code in (200, 201):
-        action = "Updated" if existing.status_code == 200 else "Created"
-        print(f"   ✅ GitHub → {action} {repo_relative_path}")
-    else:
-        print(f"   ❌ GitHub push failed [{response.status_code}]: {response.json().get('message')}")
-
-
 # ── Save ──────────────────────────────────────────────────────────────────────
 def save_merged(df: pd.DataFrame) -> None:
     PROCESSED.mkdir(parents=True, exist_ok=True)
@@ -465,7 +424,6 @@ def save_merged(df: pd.DataFrame) -> None:
     print(df["category"].value_counts().to_string())
     print("\n📊 Sentiment label distribution:")
     print(df["sentiment_label"].value_counts().to_string())
-    push_to_github(OUTPUT_PATH, f"data/processed/{OUTPUT_PATH.name}")
 
 
 def save_flags(df: pd.DataFrame) -> None:
@@ -475,7 +433,9 @@ def save_flags(df: pd.DataFrame) -> None:
     print(f"   Columns : {df.columns.tolist()}")
     print("\n📊 Nulls per column:")
     print(df.isnull().sum().to_string())
-    push_to_github(FLAGS_PATH, f"data/processed/{FLAGS_PATH.name}")
+    print("\n📊 Score ranges:")
+    for col in SENTIMENT_COLS:
+        print(f"   {col}: [{df[col].min():.4f}, {df[col].max():.4f}]  mean={df[col].mean():.4f}")
 
 
 def save_decay(df: pd.DataFrame) -> None:
@@ -488,16 +448,15 @@ def save_decay(df: pd.DataFrame) -> None:
         print(f"   {col}: [{df[col].min():.4f}, {df[col].max():.4f}]  mean={df[col].mean():.4f}")
     print("\n📊 Nulls per column:")
     print(df.isnull().sum().to_string())
-    push_to_github(DECAY_PATH, f"data/processed/{DECAY_PATH.name}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Merging news + FinBERT Sentiment Scoring")
+    print("  PSX News Scraper — Sentiment + Aggregation Pipeline")
     print("=" * 60)
 
-    # Step 1 — merge all sources + score sentiment
+    # Step 1 — load or score sentiment
     df = merge_news()
     save_merged(df)
     sanity_check(df)
@@ -517,7 +476,7 @@ if __name__ == "__main__":
     save_decay(decay_df)
 
     print("\n" + "=" * 60)
-    print("  Done — 3 CSVs saved and pushed to GitHub:")
+    print("  Done — 3 CSVs saved:")
     print(f"    {OUTPUT_PATH.name}")
     print(f"    {FLAGS_PATH.name}")
     print(f"    {DECAY_PATH.name}")
