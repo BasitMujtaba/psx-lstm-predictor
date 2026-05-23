@@ -503,24 +503,17 @@ def push_to_github():
             str(DECAY_PATH),
         ]
         cmds = [
-            ["git", "-C", project_root, "stash"],
             ["git", "-C", project_root, "pull", "--rebase", "origin", "main"],
-            ["git", "-C", project_root, "stash", "pop"],
             ["git", "-C", project_root, "add"] + files,
             ["git", "-C", project_root, "commit", "-m",
              "Update news CSVs — merged + flags + decay aggregations"],
-            ["git", "-C", project_root, "push", "origin", "main"],
+            ["git", "-C", project_root, "push"],
         ]
         for cmd in cmds:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0 and "nothing to commit" not in result.stdout:
-                if result.stderr.strip():
-                    print(f"   ⚠️  {result.stderr.strip()}")
-            elif result.stdout.strip():
-                print(f"   {result.stdout.strip()}")
+            subprocess.run(cmd, check=True, capture_output=True)
         print("   ✅ Pushed to GitHub")
-    except Exception as e:
-        print(f"   ⚠️  GitHub push failed: {e}")
+    except subprocess.CalledProcessError as e:
+        print(f"   ⚠️  GitHub push failed: {e.stderr.decode()}")
 
 
 # ── run() — single entry point ───────────────────────────────────────────────
