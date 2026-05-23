@@ -16,6 +16,8 @@
 ================================================================================
 """
 
+import os
+import subprocess
 import pandas as pd
 import torch
 from pathlib import Path
@@ -210,7 +212,7 @@ def merge_news() -> pd.DataFrame:
     """
     If news_merged.csv already exists — load and return it directly.
     Skips FinBERT re-scoring to save time.
-    Re-run with force=True or delete the CSV to re-score from scratch.
+    Delete the CSV to force a fresh re-score.
     """
     if OUTPUT_PATH.exists():
         print(f"\n✅ Cache hit — loading existing {OUTPUT_PATH.name} ...")
@@ -450,10 +452,35 @@ def save_decay(df: pd.DataFrame) -> None:
     print(df.isnull().sum().to_string())
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+# ── GitHub Push ───────────────────────────────────────────────────────────────
+def push_to_github():
+    try:
+        project_root = str(BASE_DIR)
+        files        = [
+            str(OUTPUT_PATH),
+            str(FLAGS_PATH),
+            str(DECAY_PATH),
+        ]
+        cmds = [
+            ["git", "-C", project_root, "pull", "--rebase", "origin", "main"],
+            ["git", "-C", project_root, "add"] + files,
+            ["git", "-C", project_root, "commit", "-m",
+             "Update news CSVs — merged + flags + decay aggregations"],
+            ["git", "-C", project_root, "push", "origin", "main"],
+        ]
+        for cmd in cmds:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            if result.stdout.strip():
+                print(f"   {result.stdout.strip()}")
+        print("   ✅ Pushed to GitHub")
+    except subprocess.CalledProcessError as e:
+        print(f"   ⚠️  GitHub push failed: {e.stderr.strip()}")
+
+
+# ── run() — single entry point ───────────────────────────────────────────────
+def run():
     print("=" * 60)
-    print("  PSX News Scraper — Sentiment + Aggregation Pipeline")
+    print("  PSX News Scraper — Full Pipeline")
     print("=" * 60)
 
     # Step 1 — load or score sentiment
@@ -468,16 +495,30 @@ if __name__ == "__main__":
     flags_df = aggregate_flags(df)
     save_flags(flags_df)
 
-    # Step 3 — category-wise decay aggregation
+    # Step 3 — decay aggregation
     print("\n" + "=" * 60)
     print("  Approach 2 — Category-wise Decay Aggregation")
     print("=" * 60)
     decay_df = aggregate_decay(df)
     save_decay(decay_df)
 
+    # Step 4 — push all 3 CSVs to GitHub
     print("\n" + "=" * 60)
-    print("  Done — 3 CSVs saved:")
-    print(f"    {OUTPUT_PATH.name}")
-    print(f"    {FLAGS_PATH.name}")
-    print(f"    {DECAY_PATH.name}")
+    print("  Pushing to GitHub")
     print("=" * 60)
+    push_to_github()
+
+    # Step 5 — summary
+    print("\n" + "=" * 60)
+    print("  ✅ All done — 3 CSVs saved and pushed:")
+    print(f"    {OUTPUT_PATH.name:<40} {len(df):>7,} rows")
+    print(f"    {FLAGS_PATH.name:<40} {len(flags_df):>7,} rows")
+    print(f"    {DECAY_PATH.name:<40} {len(decay_df):>7,} rows")
+    print("=" * 60)
+
+    return df, flags_df, decay_df
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    run()
