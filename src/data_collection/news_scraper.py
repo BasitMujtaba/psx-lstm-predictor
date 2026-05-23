@@ -505,12 +505,27 @@ def push_to_github():
         cmds = [
             ["git", "-C", project_root, "pull", "--rebase", "origin", "main"],
             ["git", "-C", project_root, "add"] + files,
-            ["git", "-C", project_root, "commit", "-m",
-             "Update news CSVs — merged + flags + decay aggregations"],
-            ["git", "-C", project_root, "push"],
         ]
         for cmd in cmds:
             subprocess.run(cmd, check=True, capture_output=True)
+
+        # ── commit — don't use check=True, "nothing to commit" returns exit code 1
+        commit = subprocess.run(
+            ["git", "-C", project_root, "commit", "-m",
+             "Update news CSVs — merged + flags + decay aggregations"],
+            capture_output=True, text=True
+        )
+        if "nothing to commit" in commit.stdout or "nothing to commit" in commit.stderr:
+            print("   ℹ️  Nothing new to commit — files unchanged")
+            return
+        if commit.returncode != 0:
+            print(f"   ⚠️  Commit failed: {commit.stderr.strip()}")
+            return
+
+        subprocess.run(
+            ["git", "-C", project_root, "push"],
+            check=True, capture_output=True
+        )
         print("   ✅ Pushed to GitHub")
     except subprocess.CalledProcessError as e:
         print(f"   ⚠️  GitHub push failed: {e.stderr.decode()}")
