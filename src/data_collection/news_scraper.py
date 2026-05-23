@@ -13,6 +13,11 @@
           data/processed/news_merged.csv                   <- per-article sentiment
           data/processed/news_aggregated_flags.csv         <- flag approach
           data/processed/news_aggregated_decay_catwise.csv <- category-wise decay approach
+
+ Cache logic:
+   1. news_merged.csv exists              -> load it, skip FinBERT entirely
+   2. processed source CSVs exist         -> merge + score with FinBERT, save
+   3. neither exists                      -> raise error, run scrapers first
 ================================================================================
 """
 
@@ -28,11 +33,20 @@ from tqdm import tqdm
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).resolve().parents[2]
 PROCESSED  = BASE_DIR / "data" / "processed"
+RAW_NEWS   = BASE_DIR / "data" / "raw" / "news"
 
+# ── Source files — processed scraped CSVs
 NEWS_FILES = {
     "dawn"      : PROCESSED / "dawn_news_processed.csv",
     "brecorder" : PROCESSED / "brecorder_news_processed.csv",
     "mettis"    : PROCESSED / "mettis_news_processed.csv",
+}
+
+# ── Raw scraped files — fallback if processed not found
+RAW_NEWS_FILES = {
+    "dawn"      : RAW_NEWS / "dawn_pakistan_raw.csv",
+    "brecorder" : RAW_NEWS / "brecorder_pakistan_raw.csv",
+    "mettis"    : RAW_NEWS / "mettis_pakistan_raw.csv",
 }
 
 OUTPUT_PATH = PROCESSED / "news_merged.csv"
@@ -210,33 +224,55 @@ def add_sentiment(df: pd.DataFrame) -> pd.DataFrame:
 # ── Merge ─────────────────────────────────────────────────────────────────────
 def merge_news() -> pd.DataFrame:
     """
-    If news_merged.csv already exists — load and return it directly.
-    Skips FinBERT re-scoring to save time.
-    Delete the CSV to force a fresh re-score.
+    Cache logic — 3 levels:
+
+    Level 1 — news_merged.csv exists
+        Load directly, skip FinBERT entirely. Fastest path.
+
+    Level 2 — processed source CSVs exist (dawn/brecorder/mettis processed)
+        Merge + filter + run FinBERT. Save news_merged.csv.
+
+    Level 3 — only raw scraped CSVs exist
+        Load raw, standardize, filter, run FinBERT. Save news_merged.csv.
+
+    Level 4 — nothing exists
+        Raise error — run scrapers first.
     """
+
+    # ── Level 1: news_merged.csv already exists — fastest path
     if OUTPUT_PATH.exists():
-        print(f"\n✅ Cache hit — loading existing {OUTPUT_PATH.name} ...")
+        print(f"\n✅ Level 1 cache hit — loading {OUTPUT_PATH.name} ...")
         df = pd.read_csv(OUTPUT_PATH, parse_dates=["date"])
-        print(f"   Loaded {len(df):,} rows")
-        print(f"   Date range : {df['date'].min().date()} → {df['date'].max().date()}")
+        print(f"   Loaded    : {len(df):,} rows")
+        print(f"   Date range: {df['date'].min().date()} → {df['date'].max().date()}")
+        print(f"   Columns   : {df.columns.tolist()}")
         return df
 
-    print("\n📰 No cache found — merging from source CSVs ...")
+    # ── Level 2: processed source CSVs exist
+    processed_found = {k: v for k, v in NEWS_FILES.items() if v.exists()}
+    raw_found       = {k: v for k, v in RAW_NEWS_FILES.items() if v.exists()}
+
+    if processed_found:
+        print(f"\n📰 Level 2 — loading {len(processed_found)} processed source CSVs ...")
+        files_to_load = processed_found
+    elif raw_found:
+        print(f"\n📰 Level 3 — processed CSVs missing, loading {len(raw_found)} raw CSVs ...")
+        files_to_load = raw_found
+    else:
+        raise FileNotFoundError(
+            "No news source files found in processed/ or raw/news/. "
+            "Run dawn_scraper, brecorder_scraper, mettis_scraper first."
+        )
+
     dfs = []
-    for source, path in NEWS_FILES.items():
-        if not path.exists():
-            print(f"⚠️  Not found, skipping: {path}")
-            continue
+    for source, path in files_to_load.items():
         df = pd.read_csv(path)
         df["source"] = source
         df = standardize_category(df)
         df = filter_irrelevant(df)
         df = df[["date", "category", "title", "source"]]
         dfs.append(df)
-        print(f"✅ Loaded {len(df):>6,} rows  ← {source}")
-
-    if not dfs:
-        raise FileNotFoundError("No news files found. Run scrapers first.")
+        print(f"   ✅ Loaded {len(df):>6,} rows  ← {source}  ({path.name})")
 
     merged = pd.concat(dfs, ignore_index=True)
     merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
@@ -245,11 +281,13 @@ def merge_news() -> pd.DataFrame:
     merged.dropna(subset=["date", "title"], inplace=True)
     dropped = before - len(merged)
     if dropped:
-        print(f"🗑️  Dropped {dropped:,} rows with null date/title")
+        print(f"   🗑️  Dropped {dropped:,} rows with null date/title")
 
     merged.sort_values("date", inplace=True)
     merged.reset_index(drop=True, inplace=True)
     merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
+
+    # ── Run FinBERT only when building from source
     merged = add_sentiment(merged)
     return merged
 
@@ -420,12 +458,15 @@ def save_merged(df: pd.DataFrame) -> None:
     print(f"\n💾 Saved per-article → {OUTPUT_PATH}  ({len(df):,} rows)")
     print(f"   Columns    : {df.columns.tolist()}")
     print(f"   Date range : {df['date'].min()} → {df['date'].max()}")
-    print("\n📊 Rows per source:")
-    print(df["source"].value_counts().to_string())
-    print("\n📊 Rows per category:")
-    print(df["category"].value_counts().to_string())
-    print("\n📊 Sentiment label distribution:")
-    print(df["sentiment_label"].value_counts().to_string())
+    if "source" in df.columns:
+        print("\n📊 Rows per source:")
+        print(df["source"].value_counts().to_string())
+    if "category" in df.columns:
+        print("\n📊 Rows per category:")
+        print(df["category"].value_counts().to_string())
+    if "sentiment_label" in df.columns:
+        print("\n📊 Sentiment label distribution:")
+        print(df["sentiment_label"].value_counts().to_string())
 
 
 def save_flags(df: pd.DataFrame) -> None:
@@ -462,19 +503,24 @@ def push_to_github():
             str(DECAY_PATH),
         ]
         cmds = [
+            ["git", "-C", project_root, "stash"],
             ["git", "-C", project_root, "pull", "--rebase", "origin", "main"],
+            ["git", "-C", project_root, "stash", "pop"],
             ["git", "-C", project_root, "add"] + files,
             ["git", "-C", project_root, "commit", "-m",
              "Update news CSVs — merged + flags + decay aggregations"],
             ["git", "-C", project_root, "push", "origin", "main"],
         ]
         for cmd in cmds:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            if result.stdout.strip():
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0 and "nothing to commit" not in result.stdout:
+                if result.stderr.strip():
+                    print(f"   ⚠️  {result.stderr.strip()}")
+            elif result.stdout.strip():
                 print(f"   {result.stdout.strip()}")
         print("   ✅ Pushed to GitHub")
-    except subprocess.CalledProcessError as e:
-        print(f"   ⚠️  GitHub push failed: {e.stderr.strip()}")
+    except Exception as e:
+        print(f"   ⚠️  GitHub push failed: {e}")
 
 
 # ── run() — single entry point ───────────────────────────────────────────────
@@ -482,6 +528,14 @@ def run():
     print("=" * 60)
     print("  PSX News Scraper — Full Pipeline")
     print("=" * 60)
+    print("\n📋 Cache check:")
+    print(f"   news_merged.csv          : {'✅ exists' if OUTPUT_PATH.exists() else '❌ missing'}")
+    print(f"   dawn_news_processed.csv  : {'✅ exists' if NEWS_FILES['dawn'].exists() else '❌ missing'}")
+    print(f"   brecorder_processed.csv  : {'✅ exists' if NEWS_FILES['brecorder'].exists() else '❌ missing'}")
+    print(f"   mettis_processed.csv     : {'✅ exists' if NEWS_FILES['mettis'].exists() else '❌ missing'}")
+    print(f"   dawn_raw.csv             : {'✅ exists' if RAW_NEWS_FILES['dawn'].exists() else '❌ missing'}")
+    print(f"   brecorder_raw.csv        : {'✅ exists' if RAW_NEWS_FILES['brecorder'].exists() else '❌ missing'}")
+    print(f"   mettis_raw.csv           : {'✅ exists' if RAW_NEWS_FILES['mettis'].exists() else '❌ missing'}")
 
     # Step 1 — load or score sentiment
     df = merge_news()
