@@ -7,7 +7,6 @@
           Categories are standardized to 4 values:
             macro | corporate | energy | forex
           Rows are sorted by date across all sources
-          Irrelevant non-Pakistan articles are filtered out
           Duplicates removed across all sources and categories
           Sentiment scored using FinBERT (GPU if available else CPU)
  Outputs:
@@ -82,178 +81,6 @@ CATEGORY_MAP = {
     "forex"                : "forex",
 }
 
-# ── Irrelevance Filter ────────────────────────────────────────────────────────
-IRRELEVANT_KEYWORDS = [
-    # foreign currencies
-    "yuan", "renminbi", "ringgit", "baht", "peso",
-    "lira", "rand", "ruble", "shekel", "sterling", "pound sterling",
-    # foreign indices
-    "sensex", "nifty", "bse ", "nse india", "bombay stock",
-    "shanghai", "hang seng", "nikkei", "ftse", "dow jones",
-    "s&p 500", "nasdaq", "wall street",
-    # foreign institutions
-    "us federal reserve", "european central bank", "bank of england",
-    # foreign politics
-    "brexit", "uk budget", "uk economy", "uk inflation",
-    "theresa may", "boris johnson", "trump rally", "send her back",
-    # irrelevant pak exports
-    "cutlery export", "cutlery import",
-    "surgical export", "surgical instrument",
-    "sports goods export", "leather export",
-    # foreign countries
-    "bangladesh", "sri lanka", "myanmar", "vietnam",
-    "latin america", "brazil ", "argentina ",
-    "turkey inflation", "iran sanction",
-    "afghanistan ", "african ",
-    # cricket/sports scores
-    "hat-trick", "hat trick", "wicket", "century puts",
-    "innings", "thrash", "outplay", "ppfl", "krl",
-    "pia beat", "nbp beat", "hbl beat", "ztbl", "kpt score",
-    "navy thrash", "paf beat", "army thrash", "ssgc beat",
-    "kesc crush", "scores hat", "slams hat",
-    "cricket championship", "hockey champions", "football cup",
-    "blind cricket", "coaching career",
-    # rallies with no market relevance
-    "rally in support of yemen", "rally in london",
-    "rally in bannu", "rally in bajaur", "rally in quetta",
-    "rally against holy quran", "rally to condemn",
-    "rally in new york", "pro-muslim rally",
-    "pdm rally", "pti rally", "pml-n rally", "ppp rally",
-    "mqm rally", "sunni conference",
-    # crime/social/disaster
-    "booked for student", "girls burning", "pistol and liquor",
-    "suspects arrested for", "three girls",
-    "rain disrupts life", "flood warning for",
-    "flood victims rally",
-    "death toll", "tanker fire", "plane crash", "train accident",
-    "building collapse", "explosion kills", "blast kills",
-    # celebrity/entertainment
-    "shares she's got covid", "fantastic experiences",
-    "lifetime achievement award", "vintage cars", "heavy bikes",
-    "shares first look", "shares heartfelt", "share screen space",
-    "father's day", "mother's day", "valentine's day",
-    "morning show", "drama serial", "film review",
-    # military non-economic
-    "army wins gold", "army wins silver", "army wins bronze",
-    "exercise cambrian", "cambrian patrol",
-    "pakistan army wins", "pakistan navy wins", "pakistan air force wins",
-    # foreign economy no pak link
-    "german gdp", "russia cuts interest", "hungary finance",
-    "arctic doomsday", "doomsday vault",
-    "water stress", "water scarcity index",
-    "egypt debt rating", "egypt rating",
-    # medals/awards
-    "silver medal", "gold medal", "bronze medal",
-    "wins trophy", "pride of performance",
-    "wins gold in", "wins silver in",
-    # foreign economic with no pak link
-    "record fall in japan", "eurozone unemployment",
-    "youth unemployment in europe", "europe seeking end",
-    "singapore slashes growth",
-]
-
-IRRELEVANT_REGEX = [
-    # foreign countries
-    r"\bindia\b", r"\bindian\b", r"\bmodi\b",
-    r"\bnew delhi\b", r"\brbi\b",
-    r"\buk\b", r"\bbrexit\b", r"\bpound\b",
-    r"\bsterling\b", r"\beuro\b", r"\beuros\b", r"\becb\b",
-    r"\bfederal reserve\b", r"\bwall street\b",
-    r"\bsensex\b", r"\bnifty\b", r"\byen\b",
-    r"\bwon\b", r"\byuan\b", r"\bchina\b", r"\bchinese\b",
-    r"\bjapan\b", r"\bjapanese\b",
-    r"\bgreece\b", r"\bgreek\b",
-    r"\bbelarus\b",
-    r"\bgermany\b", r"\bgerman\b",
-    r"\brussia\b", r"\brussian\b",
-    r"\bhungary\b", r"\bhungarian\b",
-    r"\begypt\b", r"\begyptian\b",
-    r"\bspain\b", r"\bspanish\b",
-    r"\bkabul\b",
-    # pure politics rallies
-    r"\bstages? rally\b", r"\bholds? rally\b",
-    r"\baddress.*rally\b", r"\brally.*against\b",
-    r"\bthousands.*rally\b", r"\btens of thousands.*rally\b",
-    r"\bdemonstration\b", r"\bprotest march\b",
-    # crime
-    r"\barrested for\b", r"\bbooked for\b",
-    r"\brake\b", r"\bmurder\b", r"\bkidnap\b",
-    r"\bterrorist attack\b", r"\bbomb blast\b",
-    # entertainment/celebrity
-    r"\bkriti sanon\b", r"\bbollywood\b",
-    r"\bfilm festival\b", r"\bmusic concert\b",
-    r"\bshares first look\b", r"\bshares heartfelt\b",
-    r"\bcelebs? share\b", r"\bactor\b", r"\bactress\b",
-    r"\billangovan\b",
-    # weather/disaster
-    r"\brain disrupts\b", r"\bflood warning\b",
-    r"\bearthquake hits\b",
-    r"\bdeath toll\b", r"\btanker fire\b",
-    r"\bplane crash\b", r"\btrain accident\b",
-    r"\bbuilding collapse\b",
-    # sports
-    r"\blifts.*cup\b", r"\bwins.*trophy\b",
-    r"\bcoaching career\b", r"\btest match\b",
-    r"\bone.day match\b", r"\bt20\b",
-    r"\bwins gold\b", r"\bwins silver\b", r"\bwins bronze\b",
-    r"\bgold medal\b", r"\bsilver medal\b", r"\bbronze medal\b",
-    r"\bcambrian\b",
-    # social/lifestyle
-    r"\bfather'?s day\b", r"\bmother'?s day\b",
-    r"\bvalentine'?s day\b", r"\beid special\b",
-    r"\bmorning show\b", r"\bdrama serial\b",
-]
-
-_PAK_SIGNAL = (
-    r"pakistan|pakist|sbp|pkr|rupee|kse|psx|karachi stock|islamabad|lahore"
-    r"|fbr|nepra|ogra|pia|cpec|remittance|rda"
-    r"|ecc|pso|ogdc|ptcl|hubco|engro|fauji|lucky|meezan"
-    r"|habib|ubi\b|mcb|nbp|ubl|bahl"
-    r"|balance of payment|bop\b|current account deficit"
-    r"|forex reserves|foreign exchange reserve"
-    r"|pak economy|pak.*export|privatisation.*airport"
-    r"|aurangzeb|ishaq dar|miftah|shaukat tarin|hafeez shaikh|reza baqir"
-    r"|stock market|share price|equity market|market capital"
-    r"|interest rate|policy rate|inflation rate|gdp growth"
-    r"|trade deficit|fiscal deficit|tax revenue|budget deficit"
-)
-
-_MARKET_SIGNAL = (
-    r"stock|share|equity|market|invest|rupee|pkr|sbp|kse|psx"
-    r"|bank|finance|fiscal|monetary|budget|tax|tariff|duty"
-    r"|inflation|gdp|growth|deficit|surplus|debt|loan|imf|adb|world bank"
-    r"|oil|gas|energy|power|electricity|fuel|coal|solar"
-    r"|export|import|trade|remittance|current account|balance of payment"
-    r"|fbr|nepra|ogra|secp|pra|revenue|privatis"
-    r"|interest rate|policy rate|yield|bond|sukuk|treasury"
-    r"|profit|loss|earnings|dividend|ipo|listing"
-    r"|cement|fertilizer|textile|automobile|pharma|chemical"
-    r"|gold|silver|commodity|cotton|wheat|sugar|rice"
-    r"|cpec|corridor|infrastructure|refinery|pipeline"
-    r"|circular debt|capacity payment|subsidy"
-)
-
-_CONTEXTUAL_RULES = [
-    (r"\bturkey\b|\berdogan\b", None),
-    (r"\bbritain\b|\bbritish\b", None),
-    (r"\brussia\b|\brussian\b",  r"pakistan|pakist|pipeline|gas|cpec|trade|wheat"),
-    (r"\bgermany\b|\bgerman\b",  r"pakistan|pakist|trade|investment|loan"),
-    (r"\begypt\b|\begyptian\b",  r"pakistan|pakist|trade|investment"),
-    (r"\bsaudi\b", r"pak economy|aurangzeb|deposit|investment|pakistan"),
-    (r"\bfederal reserve\b|\bwall street\b|\bfed rate\b|\bfed funds\b",
-     r"gold|oil|dollar|crude|commodity|pakistan|pkr|rupee"),
-    (r"\bimf\b", r"pakistan|pakist|programme|loan|bailout|staff.level|review"),
-    (r"\bworld bank\b|\badb\b|\basian development\b",
-     r"pakistan|pakist|loan|grant|project"),
-]
-
-_PSL_KEEP_SIGNAL = (
-    r"kse|psx|stock|share|equity|market|invest|rupee|pkr|sbp"
-    r"|pcb|sponsorship|revenue|broadcast|rights"
-)
-
-_PPL_FOOTBALL_RE = r"ppl balochistan football|ppl.*football cup"
-
 
 # ── Standardize Category ──────────────────────────────────────────────────────
 def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
@@ -265,40 +92,6 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
     dropped = before - len(df)
     if dropped:
         print(f"   🗑️  Dropped {dropped:,} rows with unmapped category")
-    return df
-
-
-# ── Irrelevance Filter ────────────────────────────────────────────────────────
-def filter_irrelevant(df: pd.DataFrame) -> pd.DataFrame:
-    title_lower = df["title"].str.lower()
-    drop_mask   = pd.Series(False, index=df.index)
-
-    for keyword in IRRELEVANT_KEYWORDS:
-        drop_mask |= title_lower.str.contains(keyword, na=False)
-    for pattern in IRRELEVANT_REGEX:
-        drop_mask |= title_lower.str.contains(pattern, regex=True, na=False)
-
-    for foreign_pat, extra_signal in _CONTEXTUAL_RULES:
-        pak_signal = _PAK_SIGNAL
-        if extra_signal:
-            pak_signal = pak_signal + r"|" + extra_signal
-        is_foreign = title_lower.str.contains(foreign_pat, regex=True, na=False)
-        has_pak    = title_lower.str.contains(pak_signal,  regex=True, na=False)
-        drop_mask |= (is_foreign & ~has_pak)
-
-    is_psl     = title_lower.str.contains(r"\bpsl\b", regex=True, na=False)
-    psl_is_fin = title_lower.str.contains(_PSL_KEEP_SIGNAL, regex=True, na=False)
-    drop_mask |= (is_psl & ~psl_is_fin)
-    drop_mask |= title_lower.str.contains(_PPL_FOOTBALL_RE, regex=True, na=False)
-
-    has_market = title_lower.str.contains(_MARKET_SIGNAL, regex=True, na=False)
-    drop_mask |= ~has_market
-
-    before  = len(df)
-    df      = df[~drop_mask].copy()
-    dropped = before - len(df)
-    if dropped:
-        print(f"   🚫 Dropped {dropped:,} irrelevant articles")
     return df
 
 
@@ -456,7 +249,6 @@ def merge_news() -> pd.DataFrame:
         df = pd.read_csv(path)
         df["source"] = source
         df = standardize_category(df)
-        df = filter_irrelevant(df)
         df = df[["date", "category", "title", "source"]]
         dfs.append(df)
         print(f"   ✅ Loaded {len(df):>6,} rows  ← {source}")
@@ -560,24 +352,6 @@ def aggregate_decay(df: pd.DataFrame) -> pd.DataFrame:
 # ── Sanity Check ──────────────────────────────────────────────────────────────
 def sanity_check(df: pd.DataFrame) -> None:
     print("\n🔍 Sanity Check:")
-    checks = {
-        "India"   : r"\bindia\b",   "China"   : r"\bchina\b",
-        "UK"      : r"\buk\b",      "Russia"  : r"\brussia\b",
-        "Germany" : r"\bgermany\b", "Egypt"   : r"\begypt\b",
-        "Euro"    : r"\beuro\b",    "PSL"     : r"\bpsl\b",
-        "Japan"   : r"\bjapan\b",   "Greece"  : r"\bgreece\b",
-    }
-    for label, pattern in checks.items():
-        if label == "PSL":
-            leaked = df[
-                df["title"].str.lower().str.contains(pattern, regex=True, na=False) &
-                ~df["title"].str.lower().str.contains(_PSL_KEEP_SIGNAL, regex=True, na=False)
-            ]
-        else:
-            leaked = df[df["title"].str.lower().str.contains(pattern, regex=True, na=False)]
-        status = f"⚠️  {len(leaked):,} leaked" if len(leaked) else "✅ 0"
-        print(f"   {label:<10}: {status}")
-
     norm_titles = df["title"].fillna("").apply(_normalize_title)
     exact_dups  = norm_titles.duplicated().sum()
     print(f"   Exact dupes : {'⚠️  ' + str(exact_dups) if exact_dups else '✅ 0'}")
@@ -604,7 +378,7 @@ def run():
     sanity_check(df)
     push_to_github(
         [str(OUTPUT_PATH.relative_to(BASE_DIR))],
-        "Update news_merged.csv — tightened filters + deduped + FinBERT"
+        "Update news_merged.csv — deduped + FinBERT"
     )
 
     print("\n" + "=" * 60)
