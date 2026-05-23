@@ -1,6 +1,6 @@
 """
 ================================================================================
- File   : src/data_collection/news_merged.py
+ File   : src/data_collection/news_scraper.py
  Project: PSX LSTM Predictor
  Purpose: Merge news from Dawn, BRecorder, and Mettis into a single CSV
           keeping only: date | category | title | source | sentiment_score | sentiment_label
@@ -9,7 +9,10 @@
           Rows are sorted by date across all sources
           Irrelevant non-Pakistan articles are filtered out
           Sentiment scored using FinBERT (GPU if available else CPU)
- Output : data/processed/news_merged.csv
+ Outputs:
+          data/processed/news_merged.csv                   <- per-article sentiment
+          data/processed/news_aggregated_flags.csv         <- flag approach
+          data/processed/news_aggregated_decay_catwise.csv <- category-wise decay approach
 ================================================================================
 """
 
@@ -30,10 +33,31 @@ NEWS_FILES = {
     "mettis"    : PROCESSED / "mettis_news_processed.csv",
 }
 
-OUTPUT_PATH = PROCESSED / "news_merged.csv"
+OUTPUT_PATH      = PROCESSED / "news_merged.csv"
+FLAGS_PATH       = PROCESSED / "news_aggregated_flags.csv"
+DECAY_PATH       = PROCESSED / "news_aggregated_decay_catwise.csv"
 
-FINBERT_MODEL = "ProsusAI/finbert"
-BATCH_SIZE    = 32
+FINBERT_MODEL    = "ProsusAI/finbert"
+BATCH_SIZE       = 32
+
+SENTIMENT_COLS   = [
+    "sentiment_corporate",
+    "sentiment_energy",
+    "sentiment_forex",
+    "sentiment_macro",
+]
+
+# ── Category-wise decay factors ───────────────────────────────────────────────
+# corporate : 0.7  — earnings/corporate news — fast reaction
+# energy    : 0.7  — energy prices change daily — fast decay
+# forex     : 0.8  — rupee moves linger 1-2 days longer
+# macro     : 0.85 — SBP/policy news takes longer to digest
+DECAY_FACTORS = {
+    "sentiment_corporate" : 0.7,
+    "sentiment_energy"    : 0.7,
+    "sentiment_forex"     : 0.8,
+    "sentiment_macro"     : 0.85,
+}
 
 # ── Category Mapping ──────────────────────────────────────────────────────────
 CATEGORY_MAP = {
@@ -64,32 +88,21 @@ CATEGORY_MAP = {
 
 # ── Irrelevance Filter — Substring ────────────────────────────────────────────
 IRRELEVANT_KEYWORDS = [
-    # Foreign currencies
     "yuan", "renminbi", "ringgit", "baht", "peso",
     "lira", "rand", "ruble", "shekel", "sterling", "pound sterling",
-
-    # Foreign markets / indices
     "sensex", "nifty", "bse ", "nse india", "bombay stock",
     "shanghai", "hang seng", "nikkei", "ftse", "dow jones",
     "s&p 500", "nasdaq", "wall street",
     "us federal reserve", "european central bank",
-
-    # UK / Brexit
     "brexit", "uk budget", "uk economy", "uk inflation",
     "bank of england", "theresa may", "boris johnson",
-
-    # Specific exports not relevant to PSX
     "cutlery export", "cutlery import",
     "surgical export", "surgical instrument",
     "sports goods export", "leather export",
-
-    # Other irrelevant geographies
     "bangladesh", "sri lanka", "myanmar", "vietnam",
     "latin america", "brazil ", "argentina ",
     "turkey inflation", "iran sanction",
     "afghanistan ", "african ",
-
-    # Sports
     "hat-trick", "hat trick", "wicket", "century puts",
     "innings", "thrash", "outplay", "ppfl", "krl", "wapda",
     "pia beat", "nbp beat", "hbl beat", "ztbl", "kpt score",
@@ -97,36 +110,15 @@ IRRELEVANT_KEYWORDS = [
     "kesc crush", "scores hat", "slams hat",
 ]
 
-# ── Irrelevance Filter — Regex (word boundary) ────────────────────────────────
+# ── Irrelevance Filter — Regex ────────────────────────────────────────────────
 IRRELEVANT_REGEX = [
-    # India
-    r"\bindia\b",
-    r"\bindian\b",
-    r"\bmodi\b",
-    r"\bnew delhi\b",
-    r"\brbi\b",
-
-    # UK / Europe
-    r"\buk\b",
-    r"\bbrexit\b",
-    r"\bpound\b",
-    r"\bsterling\b",
-    r"\beuro\b",
-    r"\beuros\b",
-    r"\becb\b",
-
-    # US
-    r"\bfederal reserve\b",
-    r"\bwall street\b",
-
-    # Asia / Other foreign
-    r"\bsensex\b",
-    r"\bnifty\b",
-    r"\byen\b",
-    r"\bwon\b",
-    r"\byuan\b",
-    r"\bchina\b",
-    r"\bchinese\b",
+    r"\bindia\b", r"\bindian\b", r"\bmodi\b",
+    r"\bnew delhi\b", r"\brbi\b",
+    r"\buk\b", r"\bbrexit\b", r"\bpound\b",
+    r"\bsterling\b", r"\beuro\b", r"\beuros\b", r"\becb\b",
+    r"\bfederal reserve\b", r"\bwall street\b",
+    r"\bsensex\b", r"\bnifty\b", r"\byen\b",
+    r"\bwon\b", r"\byuan\b", r"\bchina\b", r"\bchinese\b",
 ]
 
 
@@ -134,41 +126,30 @@ IRRELEVANT_REGEX = [
 def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
     if "subcategory" in df.columns:
         df["category"] = df["subcategory"].fillna(df["category"])
-
     df["category"] = (
-        df["category"]
-        .str.strip()
-        .str.lower()
-        .map(CATEGORY_MAP)
+        df["category"].str.strip().str.lower().map(CATEGORY_MAP)
     )
-
     before = len(df)
     df.dropna(subset=["category"], inplace=True)
     dropped = before - len(df)
     if dropped:
         print(f"   🗑️  Dropped {dropped:,} rows with unmapped category")
-
     return df
 
 
 # ── Irrelevance Filter ────────────────────────────────────────────────────────
 def filter_irrelevant(df: pd.DataFrame) -> pd.DataFrame:
     title_lower = df["title"].str.lower()
-
     mask = pd.Series(False, index=df.index)
     for keyword in IRRELEVANT_KEYWORDS:
         mask |= title_lower.str.contains(keyword, na=False)
-
     for pattern in IRRELEVANT_REGEX:
         mask |= title_lower.str.contains(pattern, regex=True, na=False)
-
     before  = len(df)
     df      = df[~mask].copy()
     dropped = before - len(df)
-
     if dropped:
         print(f"   🚫 Dropped {dropped:,} irrelevant articles (foreign/sports)")
-
     return df
 
 
@@ -183,55 +164,22 @@ def load_finbert(device: torch.device):
     return tokenizer, model
 
 
-def compute_sentiment(
-    titles: list,
-    tokenizer,
-    model,
-    device: torch.device,
-) -> list:
-    """
-    Returns a sentiment score per title in range [-1, +1]:
-        +1  = strong positive
-         0  = neutral
-        -1  = strong negative
-
-    FinBERT output labels: positive=0, negative=1, neutral=2
-    Score = P(positive) - P(negative)
-    """
+def compute_sentiment(titles, tokenizer, model, device):
     scores = []
-
     for i in tqdm(range(0, len(titles), BATCH_SIZE), desc="   Scoring"):
-        batch = titles[i : i + BATCH_SIZE]
-
+        batch   = titles[i : i + BATCH_SIZE]
         encoded = tokenizer(
-            batch,
-            padding=True,
-            truncation=True,
-            max_length=128,
-            return_tensors="pt",
+            batch, padding=True, truncation=True,
+            max_length=128, return_tensors="pt",
         ).to(device)
-
         with torch.no_grad():
             logits = model(**encoded).logits
-
-        probs = softmax(logits, dim=1).cpu()
-
-        pos = probs[:, 0]
-        neg = probs[:, 1]
-
-        batch_scores = (pos - neg).tolist()
-        scores.extend(batch_scores)
-
+        probs  = softmax(logits, dim=1).cpu()
+        scores.extend((probs[:, 0] - probs[:, 1]).tolist())
     return scores
 
 
 def score_to_label(score: float) -> str:
-    """
-    Convert numeric sentiment score to human-readable label.
-        score >  0.1  → positive
-        score < -0.1  → negative
-        otherwise     → neutral
-    """
     if score > 0.1:
         return "positive"
     elif score < -0.1:
@@ -243,41 +191,31 @@ def score_to_label(score: float) -> str:
 def add_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     device           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer, model = load_finbert(device)
-
     print(f"\n📊 Computing sentiment for {len(df):,} articles ...")
     titles = df["title"].fillna("").tolist()
     scores = compute_sentiment(titles, tokenizer, model, device)
-
     df["sentiment_score"] = [round(s, 4) for s in scores]
     df["sentiment_label"] = df["sentiment_score"].apply(score_to_label)
-
     print(f"   ✅ Sentiment scoring complete")
     print(f"   Score range : {df['sentiment_score'].min():.4f} → {df['sentiment_score'].max():.4f}")
     print(f"   Mean score  : {df['sentiment_score'].mean():.4f}")
-
-    # Free GPU memory
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
-
     return df
 
 
 # ── Merge ─────────────────────────────────────────────────────────────────────
 def merge_news() -> pd.DataFrame:
     dfs = []
-
     for source, path in NEWS_FILES.items():
         if not path.exists():
             print(f"⚠️  Not found, skipping: {path}")
             continue
-
         df = pd.read_csv(path)
         df["source"] = source
-
         df = standardize_category(df)
         df = filter_irrelevant(df)
-
         df = df[["date", "category", "title", "source"]]
         dfs.append(df)
         print(f"✅ Loaded {len(df):>6,} rows  ← {source}")
@@ -286,97 +224,200 @@ def merge_news() -> pd.DataFrame:
         raise FileNotFoundError("No news files found. Run scrapers first.")
 
     merged = pd.concat(dfs, ignore_index=True)
-
-    # Convert to datetime before sorting
     merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
 
-    # Drop rows with missing date or title
     before = len(merged)
     merged.dropna(subset=["date", "title"], inplace=True)
     dropped = before - len(merged)
     if dropped:
         print(f"🗑️  Dropped {dropped:,} rows with null date/title")
 
-    # Sort by date across all sources
     merged.sort_values("date", inplace=True)
     merged.reset_index(drop=True, inplace=True)
-
-    # Format date after sorting
     merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
-
-    # Add FinBERT sentiment score + label
     merged = add_sentiment(merged)
-
     return merged
+
+
+# ── Aggregation Helper ────────────────────────────────────────────────────────
+def _base_aggregate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Shared first step for both aggregation approaches.
+    Returns wide-format df with one row per date and 4 raw sentiment columns.
+    Missing category on a date = NaN (not yet filled).
+    """
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    agg = (
+        df.groupby(["date", "category"])["sentiment_score"]
+        .mean()
+        .unstack(level="category")
+        .reset_index()
+    )
+    agg.columns.name = None
+    agg = agg.rename(columns={
+        "corporate" : "sentiment_corporate",
+        "energy"    : "sentiment_energy",
+        "forex"     : "sentiment_forex",
+        "macro"     : "sentiment_macro",
+    })
+
+    # Ensure all 4 columns exist even if a category had zero articles ever
+    for col in SENTIMENT_COLS:
+        if col not in agg.columns:
+            agg[col] = float("nan")
+
+    # Article count per day
+    news_count = df.groupby("date").size().reset_index(name="news_count")
+    agg        = agg.merge(news_count, on="date", how="left")
+    agg["news_count"] = agg["news_count"].fillna(0).astype(int)
+
+    agg.sort_values("date", inplace=True)
+    agg.reset_index(drop=True, inplace=True)
+    return agg
+
+
+# ── Approach 1 — Flag Aggregation ────────────────────────────────────────────
+def aggregate_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per date with:
+      sentiment_corporate | has_corporate |
+      sentiment_energy    | has_energy    |
+      sentiment_forex     | has_forex     |
+      sentiment_macro     | has_macro     |
+      news_count
+
+    has_X = 1.0  → real news existed for that category that day
+    has_X = 0.0  → no news for that category (sentiment filled with 0.0)
+
+    Model can use has_X to know whether to trust sentiment_X.
+    Missing sentiment filled with 0.0 AFTER flags are set.
+    """
+    print("\n📊 Building flag aggregation ...")
+    agg = _base_aggregate(df)
+
+    flag_map = {
+        "sentiment_corporate" : "has_corporate",
+        "sentiment_energy"    : "has_energy",
+        "sentiment_forex"     : "has_forex",
+        "sentiment_macro"     : "has_macro",
+    }
+
+    # Set flags BEFORE filling zeros — NaN means no news
+    for sent_col, flag_col in flag_map.items():
+        agg[flag_col] = agg[sent_col].notna().astype(float)
+
+    # Fill missing sentiment with 0.0 (neutral placeholder)
+    agg[SENTIMENT_COLS] = agg[SENTIMENT_COLS].fillna(0.0)
+
+    # Reorder columns cleanly
+    col_order = [
+        "date",
+        "sentiment_corporate", "has_corporate",
+        "sentiment_energy",    "has_energy",
+        "sentiment_forex",     "has_forex",
+        "sentiment_macro",     "has_macro",
+        "news_count",
+    ]
+    agg = agg[col_order]
+
+    print(f"   ✅ Flag aggregation complete — shape: {agg.shape}")
+    print(f"   📅 Date range: {agg['date'].min().date()} → {agg['date'].max().date()}")
+    print("   📊 Coverage (% of days with real news):")
+    for flag_col in flag_map.values():
+        print(f"      {flag_col}: {agg[flag_col].mean()*100:.1f}%")
+    return agg
+
+
+# ── Approach 2 — Category-wise Decay Aggregation ──────────────────────────────
+def aggregate_decay(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per calendar day (including weekends) with:
+      sentiment_corporate | sentiment_energy | sentiment_forex | sentiment_macro | news_count
+
+    Missing category days filled via exponential decay:
+      corporate : 0.7  — fast reaction, fades in ~1 week
+      energy    : 0.7  — daily price changes, fast decay
+      forex     : 0.8  — rupee moves linger slightly longer
+      macro     : 0.85 — SBP/IMF policy news lingers longest
+
+    Real news day    → decay_value = actual FinBERT score (resets signal)
+    No news day      → decay_value = previous_value × decay_factor
+    Signal gone      → approaches 0.0 naturally (genuine neutral = 0.0 is valid)
+
+    Reindexed to full calendar so weekends/holidays are included.
+    """
+    print("\n📊 Building category-wise decay aggregation ...")
+    agg = _base_aggregate(df)
+
+    # Reindex to full calendar — handles weekends + market holidays
+    full_dates = pd.date_range(start=agg["date"].min(), end=agg["date"].max(), freq="D")
+    agg        = agg.set_index("date").reindex(full_dates)
+    agg.index.name = "date"
+
+    # Carry news_count = 0 on reindexed days
+    agg["news_count"] = agg["news_count"].fillna(0).astype(int)
+
+    # Apply decay per category
+    for col, factor in DECAY_FACTORS.items():
+        values = agg[col].copy()
+        for i in range(1, len(values)):
+            if pd.isna(values.iloc[i]):
+                values.iloc[i] = values.iloc[i - 1] * factor
+        agg[col] = values
+        print(f"   {col:<25} decay factor = {factor}")
+
+    # Fill any remaining NaNs at very start of data (before first article)
+    agg[SENTIMENT_COLS] = agg[SENTIMENT_COLS].fillna(0.0).round(4)
+
+    agg = agg.reset_index()
+    agg.sort_values("date", inplace=True)
+    agg.reset_index(drop=True, inplace=True)
+    agg = agg[["date"] + SENTIMENT_COLS + ["news_count"]]
+
+    real_days  = (agg["news_count"] > 0).sum()
+    decay_days = (agg["news_count"] == 0).sum()
+    print(f"   ✅ Decay aggregation complete — shape: {agg.shape}")
+    print(f"   📅 Date range : {agg['date'].min().date()} → {agg['date'].max().date()}")
+    print(f"   📊 Real news days  : {real_days:,} ({real_days/len(agg)*100:.1f}%)")
+    print(f"   📊 Decay-only days : {decay_days:,} ({decay_days/len(agg)*100:.1f}%)")
+    return agg
 
 
 # ── Sanity Check ──────────────────────────────────────────────────────────────
 def sanity_check(df: pd.DataFrame) -> None:
-    print("\n🔍 Sanity Check:")
-
+    print("\n🔍 Sanity Check (per-article):")
     checks = {
-        "India articles"  : r"\bindia\b",
-        "Indian articles" : r"\bindian\b",
-        "UK articles"     : r"\buk\b",
-        "Brexit articles" : r"\bbrexit\b",
-        "Pound articles"  : r"\bpound\b",
-        "China articles"  : r"\bchina\b",
-        "Euro articles"   : r"\beuro\b",
+        "India"  : r"\bindia\b",  "Indian" : r"\bindian\b",
+        "UK"     : r"\buk\b",     "Brexit" : r"\bbrexit\b",
+        "Pound"  : r"\bpound\b",  "China"  : r"\bchina\b",
+        "Euro"   : r"\beuro\b",
     }
-
     all_clear = True
     for label, pattern in checks.items():
         leaked = df[df["title"].str.lower().str.contains(pattern, regex=True, na=False)]
-        if len(leaked) > 0:
-            print(f"   ⚠️  {label} leaked      : {len(leaked):,}")
-            print(leaked["title"].head(3).to_string())
+        if len(leaked):
+            print(f"   ⚠️  {label} leaked: {len(leaked):,}")
             all_clear = False
         else:
-            print(f"   ✅ {label:<20} : 0")
+            print(f"   ✅ {label:<20}: 0")
 
-    # Check only 4 categories exist
-    cats     = sorted(df["category"].unique().tolist())
-    expected = ["corporate", "energy", "forex", "macro"]
-    if cats == expected:
-        print(f"   ✅ Categories                : {cats}")
+    cats = sorted(df["category"].unique().tolist())
+    if cats == ["corporate", "energy", "forex", "macro"]:
+        print(f"   ✅ Categories: {cats}")
     else:
-        print(f"   ⚠️  Unexpected categories    : {cats}")
-
-    # Check sentiment_score
-    if "sentiment_score" in df.columns:
-        nulls = df["sentiment_score"].isna().sum()
-        if nulls == 0:
-            print(f"   ✅ sentiment_score           : no nulls, range [{df['sentiment_score'].min():.4f}, {df['sentiment_score'].max():.4f}]")
-        else:
-            print(f"   ⚠️  sentiment_score nulls    : {nulls:,}")
-    else:
-        print(f"   ⚠️  sentiment_score column missing")
-
-    # Check sentiment_label
-    if "sentiment_label" in df.columns:
-        nulls  = df["sentiment_label"].isna().sum()
-        labels = sorted(df["sentiment_label"].unique().tolist())
-        if nulls == 0 and set(labels) <= {"positive", "negative", "neutral"}:
-            print(f"   ✅ sentiment_label           : {labels}")
-        else:
-            print(f"   ⚠️  sentiment_label issue     : nulls={nulls}, labels={labels}")
-    else:
-        print(f"   ⚠️  sentiment_label column missing")
-
-    # Check sources
-    sources = sorted(df["source"].unique().tolist())
-    print(f"   ✅ Sources                   : {sources}")
+        print(f"   ⚠️  Unexpected categories: {cats}")
 
     if all_clear:
-        print("\n   ✅ All checks passed")
+        print("\n   ✅ All sanity checks passed")
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 def save_merged(df: pd.DataFrame) -> None:
     PROCESSED.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_PATH, index=False)
-    print(f"\n💾 Saved → {OUTPUT_PATH}")
-    print(f"   Total rows : {len(df):,}")
+    print(f"\n💾 Saved per-article → {OUTPUT_PATH}  ({len(df):,} rows)")
     print(f"   Columns    : {df.columns.tolist()}")
     print(f"   Date range : {df['date'].min()} → {df['date'].max()}")
     print("\n📊 Rows per source:")
@@ -385,21 +426,57 @@ def save_merged(df: pd.DataFrame) -> None:
     print(df["category"].value_counts().to_string())
     print("\n📊 Sentiment label distribution:")
     print(df["sentiment_label"].value_counts().to_string())
-    print(f"\n📊 Sentiment score stats:")
-    print(f"   Min    : {df['sentiment_score'].min():.4f}")
-    print(f"   Max    : {df['sentiment_score'].max():.4f}")
-    print(f"   Mean   : {df['sentiment_score'].mean():.4f}")
-    print(f"   Median : {df['sentiment_score'].median():.4f}")
+
+
+def save_flags(df: pd.DataFrame) -> None:
+    PROCESSED.mkdir(parents=True, exist_ok=True)
+    df.to_csv(FLAGS_PATH, index=False)
+    print(f"\n💾 Saved flags      → {FLAGS_PATH}  ({len(df):,} rows)")
+    print(f"   Columns : {df.columns.tolist()}")
+    print("\n📊 Nulls per column:")
+    print(df.isnull().sum().to_string())
+
+
+def save_decay(df: pd.DataFrame) -> None:
+    PROCESSED.mkdir(parents=True, exist_ok=True)
+    df.to_csv(DECAY_PATH, index=False)
+    print(f"\n💾 Saved decay      → {DECAY_PATH}  ({len(df):,} rows)")
+    print(f"   Columns : {df.columns.tolist()}")
+    print("\n📊 Score ranges:")
+    for col in SENTIMENT_COLS:
+        print(f"   {col}: [{df[col].min():.4f}, {df[col].max():.4f}]  mean={df[col].mean():.4f}")
+    print("\n📊 Nulls per column:")
+    print(df.isnull().sum().to_string())
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Merging news sources + FinBERT Sentiment Scoring")
+    print("  Merging news + FinBERT Sentiment Scoring")
     print("=" * 60)
+
+    # Step 1 — merge all sources + score sentiment
     df = merge_news()
     save_merged(df)
     sanity_check(df)
+
+    # Step 2 — flag aggregation
+    print("\n" + "=" * 60)
+    print("  Approach 1 — Flag Aggregation")
     print("=" * 60)
-    print("  Done")
+    flags_df = aggregate_flags(df)
+    save_flags(flags_df)
+
+    # Step 3 — category-wise decay aggregation
+    print("\n" + "=" * 60)
+    print("  Approach 2 — Category-wise Decay Aggregation")
+    print("=" * 60)
+    decay_df = aggregate_decay(df)
+    save_decay(decay_df)
+
+    print("\n" + "=" * 60)
+    print("  Done — 3 CSVs saved:")
+    print(f"    {OUTPUT_PATH.name}")
+    print(f"    {FLAGS_PATH.name}")
+    print(f"    {DECAY_PATH.name}")
     print("=" * 60)
