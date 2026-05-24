@@ -4,6 +4,10 @@ src/feature_engineering/merger.py
 Shifts news sentiment by 1 trading day (no look-ahead bias) and
 joins it onto the price data for both decay and flags variants.
 
+Also computes per-ticker sentiment from articles mentioning each
+ticker by name. Tickers with < 30 matching articles fall back to
+their category sentiment (energy or macro).
+
 Outputs
 -------
   data/processed/prices_news_joined_decay.csv
@@ -23,6 +27,47 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 BASE         = os.path.join(PROJECT_ROOT, "data")
 
 
+# ── Ticker -> keyword mapping ─────────────────────────────────────────────────
+
+TICKER_KEYWORDS = {
+    "OGDC":   ["ogdc", "oil and gas development", "ogdcl"],
+    "PPL":    ["ppl", "pakistan petroleum"],
+    "MARI":   ["mari", "mari petroleum"],
+    "PSO":    ["pso", "pakistan state oil"],
+    "HBL":    ["hbl", "habib bank"],
+    "MCB":    ["mcb", "muslim commercial bank"],
+    "UBL":    ["ubl", "united bank"],
+    "NBP":    ["nbp", "national bank"],
+    "BAFL":   ["bafl", "bank alfalah"],
+    "ENGRO":  ["engro"],
+    "EFERT":  ["efert", "engro fertilizer"],
+    "FATIMA": ["fatima", "fatima fertilizer"],
+    "FFC":    ["ffc", "fauji fertilizer"],
+    "LUCK":   ["lucky cement", "lucky"],
+    "DGKC":   ["dgkc", "dg khan cement", "d.g. khan"],
+    "MLCF":   ["mlcf", "maple leaf cement"],
+    "PIOC":   ["pioc", "pioneer cement"],
+    "NML":    ["nml", "nishat mills"],
+    "NCL":    ["ncl", "nishat chunian"],
+    "GATM":   ["gatm", "ghani", "ghani auto"],
+    "TRG":    ["trg", "trg pakistan"],
+    "SYS":    ["sys", "systems limited"],
+    "AVN":    ["avn", "avanceon"],
+    "SEARL":  ["searl", "searle"],
+    "FEROZ":  ["feroz", "ferozsons"],
+    "INDU":   ["indu", "indus motor"],
+    "PSMC":   ["psmc", "pak suzuki"],
+    "HUBC":   ["hub power", "hubco", "hubc"],
+    "KAPCO":  ["kapco", "kot addu power"],
+    "POL":    ["pol", "pakistan oilfields"],
+}
+
+# tickers whose category fallback is energy sentiment
+ENERGY_TICKERS = {"OGDC", "PPL", "MARI", "PSO", "POL", "HUBC", "KAPCO"}
+
+MIN_ARTICLES = 30   # minimum articles to use per-ticker sentiment
+
+
 # ── GitHub push ───────────────────────────────────────────────────────────────
 
 def _push_to_github(decay_path, flags_path):
@@ -31,7 +76,7 @@ def _push_to_github(decay_path, flags_path):
             ["git", "-C", PROJECT_ROOT, "pull", "--rebase", "origin", "main"],
             ["git", "-C", PROJECT_ROOT, "add", decay_path, flags_path],
             ["git", "-C", PROJECT_ROOT, "commit", "-m",
-             "Update prices_news_joined_decay and prices_news_joined_flags"],
+             "Update joined CSVs with per-ticker sentiment"],
             ["git", "-C", PROJECT_ROOT, "push"],
         ]
         for cmd in cmds:
@@ -41,19 +86,85 @@ def _push_to_github(decay_path, flags_path):
         log.warning("GitHub push failed: %s", e.stderr.decode())
 
 
+# ── Build per-ticker daily sentiment ─────────────────────────────────────────
+
+def _build_ticker_sentiment(news_path, trading_dates, tickers):
+    """
+    For each ticker, finds articles mentioning it by name,
+    aggregates daily mean sentiment, shifts by 1 trading day,
+    and returns a DataFrame with columns: date, ticker, sentiment_ticker.
+
+    Tickers with < MIN_ARTICLES total fall back to category sentiment
+    (handled later in run() during the merge).
+    """
+    log.info("Loading news for per-ticker sentiment: %s", news_path)
+    news = pd.read_csv(news_path, parse_dates=["date"])
+    news["title_lower"] = news["title"].str.lower()
+
+    frames = []
+    used_ticker_sentiment = []
+    used_fallback         = []
+
+    for ticker in tickers:
+        keywords = TICKER_KEYWORDS.get(ticker, [ticker.lower()])
+        pattern  = "|".join(keywords)
+        mask     = news["title_lower"].str.contains(pattern, na=False)
+        matched  = news[mask]
+
+        if len(matched) < MIN_ARTICLES:
+            used_fallback.append(ticker)
+            continue
+
+        # daily mean sentiment
+        daily = (matched
+                 .groupby("date")["sentiment_score"]
+                 .mean()
+                 .reset_index()
+                 .rename(columns={"sentiment_score": "sentiment_ticker_raw"}))
+
+        # shift by 1 trading day using trading calendar
+        shifted = (trading_dates
+                   .merge(daily,
+                          left_on="prev_trading_date",
+                          right_on="date",
+                          how="left")
+                   .rename(columns={"date_x": "date"})
+                   .drop(columns=["date_y", "prev_trading_date"]))
+
+        shifted["ticker"]            = ticker
+        shifted["sentiment_ticker"]  = shifted["sentiment_ticker_raw"].fillna(np.nan)
+        frames.append(shifted[["date", "ticker", "sentiment_ticker"]])
+        used_ticker_sentiment.append(ticker)
+
+    log.info("Per-ticker sentiment built for: %s", used_ticker_sentiment)
+    log.info("Falling back to category sentiment for: %s", used_fallback)
+
+    if frames:
+        return pd.concat(frames, ignore_index=True), used_ticker_sentiment, used_fallback
+    else:
+        return pd.DataFrame(columns=["date", "ticker", "sentiment_ticker"]), [], tickers
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
     # ── Load files
-    prices = pd.read_csv(os.path.join(BASE, "processed", "psx_prices_processed.csv"),         parse_dates=["date"])
-    decay  = pd.read_csv(os.path.join(BASE, "processed", "news_aggregated_decay_catwise.csv"), parse_dates=["date"])
-    flags  = pd.read_csv(os.path.join(BASE, "processed", "news_aggregated_flags.csv"),         parse_dates=["date"])
+    prices = pd.read_csv(
+        os.path.join(BASE, "processed", "psx_prices_processed.csv"),
+        parse_dates=["date"])
+    decay  = pd.read_csv(
+        os.path.join(BASE, "processed", "news_aggregated_decay_catwise.csv"),
+        parse_dates=["date"])
+    flags  = pd.read_csv(
+        os.path.join(BASE, "processed", "news_aggregated_flags.csv"),
+        parse_dates=["date"])
 
-    log.info("Prices : %s | %s -> %s", prices.shape, prices["date"].min().date(), prices["date"].max().date())
-    log.info("Decay  : %s | %s -> %s", decay.shape,  decay["date"].min().date(),  decay["date"].max().date())
-    log.info("Flags  : %s | %s -> %s", flags.shape,  flags["date"].min().date(),  flags["date"].max().date())
+    log.info("Prices : %s | %s -> %s",
+             prices.shape,
+             prices["date"].min().date(),
+             prices["date"].max().date())
 
-    # ── Build trading calendar from price data
+    # ── Build trading calendar
     trading_dates = (prices[["date"]]
                      .drop_duplicates()
                      .sort_values("date")
@@ -61,74 +172,116 @@ def run():
     trading_dates["prev_trading_date"] = trading_dates["date"].shift(1)
     log.info("Unique trading days: %d", len(trading_dates))
 
-    # ── Shift news by 1 trading day
+    # ── Shift category sentiment by 1 trading day
     decay_shifted = (trading_dates
-                     .merge(decay, left_on="prev_trading_date", right_on="date", how="left")
+                     .merge(decay,
+                            left_on="prev_trading_date",
+                            right_on="date",
+                            how="left")
                      .rename(columns={"date_x": "date"})
                      .drop(columns=["date_y", "prev_trading_date"]))
 
     flags_shifted = (trading_dates
-                     .merge(flags, left_on="prev_trading_date", right_on="date", how="left")
+                     .merge(flags,
+                            left_on="prev_trading_date",
+                            right_on="date",
+                            how="left")
                      .rename(columns={"date_x": "date"})
                      .drop(columns=["date_y", "prev_trading_date"]))
 
-    # ── Fill NaNs
-    decay_sentiment_cols = ["sentiment_corporate", "sentiment_energy", "sentiment_forex", "sentiment_macro", "news_count"]
-    flags_sentiment_cols = ["sentiment_corporate", "has_corporate", "sentiment_energy", "has_energy",
-                            "sentiment_forex", "has_forex", "sentiment_macro", "has_macro", "news_count"]
-
+    # ── Fill NaNs for category sentiment
+    decay_sentiment_cols = [
+        "sentiment_corporate", "sentiment_energy",
+        "sentiment_forex", "sentiment_macro", "news_count",
+    ]
+    flags_sentiment_cols = [
+        "sentiment_corporate", "has_corporate",
+        "sentiment_energy",    "has_energy",
+        "sentiment_forex",     "has_forex",
+        "sentiment_macro",     "has_macro",
+        "news_count",
+    ]
     decay_shifted[decay_sentiment_cols] = decay_shifted[decay_sentiment_cols].fillna(0.0)
     flags_shifted[flags_sentiment_cols] = flags_shifted[flags_sentiment_cols].fillna(0.0)
 
-    log.info("Decay shifted : %s | NaNs: %d", decay_shifted.shape, decay_shifted.isna().sum().sum())
-    log.info("Flags shifted : %s | NaNs: %d", flags_shifted.shape, flags_shifted.isna().sum().sum())
+    # ── Build per-ticker sentiment
+    tickers    = prices["ticker"].unique().tolist()
+    news_path  = os.path.join(BASE, "processed", "news_filtered.csv")
 
-    # ── Join onto prices
+    ticker_sent, used_ticker, used_fallback = _build_ticker_sentiment(
+        news_path, trading_dates, tickers,
+    )
+
+    # ── Join category sentiment onto prices
     prices_decay = prices.merge(decay_shifted, on="date", how="left")
     prices_flags = prices.merge(flags_shifted, on="date", how="left")
 
-    log.info("Prices + Decay : %s (expected %d rows x %d cols)",
-             prices_decay.shape, prices.shape[0], prices.shape[1] + len(decay_sentiment_cols))
-    log.info("Prices + Flags : %s (expected %d rows x %d cols)",
-             prices_flags.shape, prices.shape[0], prices.shape[1] + len(flags_sentiment_cols))
+    # ── Join per-ticker sentiment onto prices
+    for df_prices in [prices_decay, prices_flags]:
 
-    # ── Verify broadcast — all tickers on same date share same sentiment
-    log.info("Broadcast check (DECAY) — all tickers on 2012-03-16:")
-    sample = prices_decay[prices_decay["date"] == "2012-03-16"][
-        ["date", "ticker", "close", "sentiment_energy", "sentiment_macro", "news_count"]
-    ]
-    log.info("  Unique sentiment_energy values : %d (should be 1)", sample["sentiment_energy"].nunique())
-    log.info("  Unique sentiment_macro  values : %d (should be 1)", sample["sentiment_macro"].nunique())
+        # merge ticker-level sentiment where available
+        df_prices["sentiment_ticker"] = np.nan
+        if not ticker_sent.empty:
+            df_prices = df_prices.merge(
+                ticker_sent,
+                on=["date", "ticker"],
+                how="left",
+                suffixes=("", "_new"),
+            )
+            # use new column if it exists
+            if "sentiment_ticker_new" in df_prices.columns:
+                df_prices["sentiment_ticker"] = df_prices["sentiment_ticker_new"]
+                df_prices.drop(columns=["sentiment_ticker_new"], inplace=True)
+            else:
+                df_prices["sentiment_ticker"] = df_prices["sentiment_ticker"]
 
-    # ── Verify Fri -> Mon
-    log.info("Fri -> Mon check (DECAY, first 3 Mondays):")
-    mondays = prices_decay[prices_decay["date"].dt.weekday == 0].drop_duplicates("date").head(3)
-    for _, row in mondays.iterrows():
-        monday   = row["date"]
-        friday   = trading_dates.loc[trading_dates["date"] == monday, "prev_trading_date"].values[0]
-        fri_news = decay[decay["date"] == friday][["sentiment_energy", "sentiment_macro"]]
-        if not fri_news.empty:
-            match_e = round(fri_news["sentiment_energy"].values[0], 4) == round(row["sentiment_energy"], 4)
-            match_m = round(fri_news["sentiment_macro"].values[0],  4) == round(row["sentiment_macro"],  4)
-            log.info("  Friday %s -> Monday %s | energy %s | macro %s",
-                     pd.Timestamp(friday).date(), pd.Timestamp(monday).date(),
-                     "OK" if match_e else "MISMATCH", "OK" if match_m else "MISMATCH")
-        else:
-            log.info("  Friday %s -> Monday %s | no news found for Friday",
-                     pd.Timestamp(friday).date(), pd.Timestamp(monday).date())
+        # fallback: for tickers without enough articles use category sentiment
+        for ticker in used_fallback:
+            mask = df_prices["ticker"] == ticker
+            if ticker in ENERGY_TICKERS:
+                df_prices.loc[mask, "sentiment_ticker"] =                     df_prices.loc[mask, "sentiment_energy"]
+            else:
+                df_prices.loc[mask, "sentiment_ticker"] =                     df_prices.loc[mask, "sentiment_macro"]
 
-    # ── NaN report after join
-    nan_d = prices_decay[decay_sentiment_cols].isna().sum()
-    log.info("NaN report (DECAY): %s", "clean" if not nan_d.any() else nan_d.to_string())
-    nan_f = prices_flags[flags_sentiment_cols].isna().sum()
-    log.info("NaN report (FLAGS): %s", "clean" if not nan_f.any() else nan_f.to_string())
+        # fill any remaining NaN with 0
+        df_prices["sentiment_ticker"] = df_prices["sentiment_ticker"].fillna(0.0)
 
-    # ── Sort by ticker -> date (for LSTM sequence training)
+    # rebuild after in-loop reassignment
+    prices_decay = prices.merge(decay_shifted, on="date", how="left")
+    prices_flags = prices.merge(flags_shifted, on="date", how="left")
+
+    # ── Attach sentiment_ticker cleanly
+    for name, df_prices in [("decay", prices_decay), ("flags", prices_flags)]:
+        df_prices["sentiment_ticker"] = np.nan
+
+        if not ticker_sent.empty:
+            tmp = df_prices.merge(
+                ticker_sent, on=["date", "ticker"], how="left"
+            )
+            df_prices["sentiment_ticker"] = tmp["sentiment_ticker"].values
+
+        for ticker in used_fallback:
+            mask = df_prices["ticker"] == ticker
+            if ticker in ENERGY_TICKERS:
+                df_prices.loc[mask, "sentiment_ticker"] =                     df_prices.loc[mask, "sentiment_energy"]
+            else:
+                df_prices.loc[mask, "sentiment_ticker"] =                     df_prices.loc[mask, "sentiment_macro"]
+
+        df_prices["sentiment_ticker"] = df_prices["sentiment_ticker"].fillna(0.0)
+
+        log.info(
+            "%s sentiment_ticker — mean=%.4f  zeros=%.1f%%  nulls=%d",
+            name.upper(),
+            df_prices["sentiment_ticker"].mean(),
+            (df_prices["sentiment_ticker"] == 0).mean() * 100,
+            df_prices["sentiment_ticker"].isna().sum(),
+        )
+
+    # ── Sort
     prices_decay = prices_decay.sort_values(["ticker", "date"]).reset_index(drop=True)
     prices_flags = prices_flags.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     log.info("Final columns (DECAY): %s", prices_decay.columns.tolist())
-    log.info("Final columns (FLAGS): %s", prices_flags.columns.tolist())
 
     # ── Save
     processed_dir = os.path.join(BASE, "processed")
@@ -140,10 +293,11 @@ def run():
     prices_decay.to_csv(decay_path, index=False)
     prices_flags.to_csv(flags_path, index=False)
 
-    log.info("Saved -> %s  (%s, %.1f MB)", decay_path, prices_decay.shape, os.path.getsize(decay_path) / 1e6)
-    log.info("Saved -> %s  (%s, %.1f MB)", flags_path, prices_flags.shape, os.path.getsize(flags_path) / 1e6)
+    log.info("Saved decay -> %s  (%.1f MB)",
+             decay_path, os.path.getsize(decay_path) / 1e6)
+    log.info("Saved flags -> %s  (%.1f MB)",
+             flags_path, os.path.getsize(flags_path) / 1e6)
 
-    # ── Push to GitHub
     _push_to_github(decay_path, flags_path)
 
     return prices_decay, prices_flags
