@@ -26,13 +26,13 @@ config.yaml sections used
 -------------------------
   model:
     input_size:      31
-    lstm_hidden:     128
-    lstm_layers:     2
-    lstm_dropout:    0.4
-    fc_hidden:       128
-    num_heads:       4
-    cross_heads:     2
-    use_ensemble:    true
+    lstm_hidden:     64
+    lstm_layers:     1
+    lstm_dropout:    0.3
+    fc_hidden:       64
+    num_heads:       2
+    cross_heads:     1
+    use_ensemble:    false
     checkpoints_dir: src/models/checkpoints
 
   training:
@@ -113,7 +113,7 @@ def save_resume_checkpoint(path, model, optimiser, scheduler,
 
 
 def load_resume_checkpoint(path, model, optimiser, scheduler, device="cpu"):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     optimiser.load_state_dict(ckpt["optimiser_state"])
     scheduler.load_state_dict(ckpt["scheduler_state"])
@@ -130,7 +130,7 @@ def load_resume_checkpoint(path, model, optimiser, scheduler, device="cpu"):
 
 
 def load_best_checkpoint(path, model, device="cpu"):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     log.info("Best checkpoint loaded <- %s  (epoch=%d  val_auc=%.4f)",
              path, ckpt["epoch"], ckpt["val_auc"])
