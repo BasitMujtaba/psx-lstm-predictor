@@ -1,5 +1,5 @@
 """
-src/feature_engineering/features.py
+src/feature_engineering/merger.py
 =======================================
 Shifts news sentiment by 1 trading day (no look-ahead bias) and
 joins it onto the price data for both decay and flags variants.
