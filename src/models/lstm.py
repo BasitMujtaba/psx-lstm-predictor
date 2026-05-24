@@ -2,42 +2,45 @@
 src/models/lstm.py
 ====================
 Deep hierarchical LSTM with cross-scale attention, gated feature fusion,
-Fourier temporal encoding, uncertainty-aware output, and optional ensemble
-with XGBoost / Random Forest for PSX return prediction.
-
-input  : (batch, seq_len, n_features)   float32
-output : (batch,)                       float32  scaled return
+Fourier temporal encoding, and stacking ensemble with XGBoost / RandomForest
+for PSX stock direction classification (UP=1 / DOWN=0).
 
 Architecture
 ------------
-  Input
-    -> Fourier Temporal Encoding (learnable + fixed sinusoidal)
-    -> Gated Feature Projection (highway connection)
-    -> Multi-Scale LSTM Tower  (short / mid / long horizon, parallel)
-    -> Cross-Scale Attention   (each scale attends to all others)
-    -> Intra-Scale Temporal Attention (per-scale self-attention)
-    -> Hierarchical Residual Fusion + LayerNorm
-    -> Learnable Temporal Pooling (soft attention weights)
-    -> Deep GELU FC Head with uncertainty estimation
-    -> [Optional] XGBoost / RandomForest ensemble on extracted features
-    -> [Optional] Stacking meta-learner (Ridge) to blend all predictions
+  Input (B, seq_len, n_features)
+    -> GatedProjection          (highway connection to d_model)
+    -> FourierTemporalEncoding  (learnable + fixed sinusoidal)
+    -> MultiScaleLSTMTower      (short / mid / long, parallel BiLSTMs)
+    -> CrossScaleAttention      (each scale attends to all others)
+    -> TemporalAttention        (intra-scale self-attention + rel-pos bias)
+    -> Hierarchical gated fusion + scale gate
+    -> LearnableTemporalPool    (soft + mean + max)
+    -> ClassificationHead       (GELU FC -> single logit)
+    -> [Optional] XGBoost + RandomForest on encode() features
+    -> [Optional] Logistic Regression meta-learner (stacking)
 
-config.yaml keys used:
+Output
+------
+  forward()       -> (B,)  raw logit   use BCEWithLogitsLoss in trainer
+  encode()        -> (B, D*3)  pooled representation for tree ensemble
+  predict_proba() -> (B,)  sigmoid probability  (inference only)
+
+config.yaml keys used
+---------------------
   model:
-    architecture:    "lstm"
-    input_size:      50
-    lstm_hidden:     256
-    lstm_layers:     4
-    lstm_dropout:    0.3
-    fc_hidden:       256
-    num_heads:       8
-    cross_heads:     4
-    use_ensemble:    true
-    xgb_trees:       1000
-    xgb_depth:       6
-    xgb_lr:          0.02
-    rf_trees:        500
-    rf_depth:        14
+    input_size:   31
+    lstm_hidden:  256
+    lstm_layers:  4
+    lstm_dropout: 0.3
+    fc_hidden:    256
+    num_heads:    8
+    cross_heads:  4
+    use_ensemble: true
+    xgb_trees:    500
+    xgb_depth:    6
+    xgb_lr:       0.02
+    rf_trees:     300
+    rf_depth:     14
 """
 
 import logging
@@ -61,7 +64,7 @@ class FourierTemporalEncoding(nn.Module):
     """
     def __init__(self, d_model, max_len=512):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
+        pe  = torch.zeros(max_len, d_model)
         pos = torch.arange(max_len).unsqueeze(1).float()
         div = torch.exp(
             torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
@@ -92,8 +95,7 @@ class FourierTemporalEncoding(nn.Module):
 class GatedProjection(nn.Module):
     """
     Projects raw features to d_model with a highway gating mechanism.
-    Gate controls how much of the raw (linearly projected) signal passes
-    vs. the nonlinear transformed signal.
+    Gate controls how much of the nonlinear vs linear signal passes through.
     """
     def __init__(self, in_features, d_model, dropout=0.1):
         super().__init__()
@@ -120,9 +122,10 @@ class GatedProjection(nn.Module):
 class MultiScaleLSTMTower(nn.Module):
     """
     Three independent Bidirectional LSTMs in parallel:
-      Scale 0 (short)  – shallow, narrow   -> fast patterns
-      Scale 1 (mid)    – medium depth      -> medium-term momentum
-      Scale 2 (long)   – deep, wide        -> macro regime features
+      Scale 0 (short) – shallow, narrow   -> fast patterns
+      Scale 1 (mid)   – medium depth      -> medium-term momentum
+      Scale 2 (long)  – deep, wide        -> macro regime features
+    All scales project back to d_model so they can be fused uniformly.
     """
     def __init__(self, d_model, hidden_size, num_layers, dropout):
         super().__init__()
@@ -156,7 +159,7 @@ class MultiScaleLSTMTower(nn.Module):
         for lstm, proj in zip(self.lstms, self.projs):
             out, _ = lstm(x)
             outputs.append(proj(out))
-        return outputs
+        return outputs   # list of 3 tensors, each (B, T, d_model)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,9 +168,9 @@ class MultiScaleLSTMTower(nn.Module):
 
 class CrossScaleAttention(nn.Module):
     """
-    Each scale acts as query; all other scales (concatenated) act as
-    key/value. Lets the short-term LSTM ask the long-term LSTM about
-    macro regime context.
+    Each scale acts as query; all other scales (concatenated over time)
+    act as key/value. Lets the short-term LSTM query macro regime context
+    from the long-term LSTM.
     """
     def __init__(self, d_model, num_heads=4, dropout=0.1):
         super().__init__()
@@ -177,7 +180,7 @@ class CrossScaleAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, query_scale, context_scales):
-        ctx = torch.stack(context_scales, dim=2)
+        ctx = torch.stack(context_scales, dim=2)   # (B, T, N, D)
         B, T, N, D = ctx.shape
         ctx = ctx.view(B, T * N, D)
         out, _ = self.attn(query_scale, ctx, ctx)
@@ -211,11 +214,11 @@ class TemporalAttention(nn.Module):
         return bias.permute(2, 0, 1)
 
     def forward(self, x):
-        B, T, D = x.shape
+        B, T, D   = x.shape
         bias      = self._rel_bias(T, x.device)
         attn_mask = bias.unsqueeze(0).expand(B, -1, -1, -1)
         attn_mask = attn_mask.reshape(B * self.num_heads, T, T)
-        out, _ = self.attn(x, x, x, attn_mask=attn_mask)
+        out, _    = self.attn(x, x, x, attn_mask=attn_mask)
         return self.norm(x + self.dropout(out))
 
 
@@ -225,7 +228,8 @@ class TemporalAttention(nn.Module):
 
 class LearnableTemporalPool(nn.Module):
     """
-    Soft weighted sum over timesteps + mean + max concatenated.
+    Soft weighted sum over timesteps concatenated with mean and max pooling.
+    Output size: d_model * 3
     """
     def __init__(self, d_model):
         super().__init__()
@@ -236,25 +240,26 @@ class LearnableTemporalPool(nn.Module):
         )
 
     def forward(self, x):
-        weights  = self.score(x).squeeze(-1)
-        weights  = F.softmax(weights, dim=-1)
-        soft     = (x * weights.unsqueeze(-1)).sum(1)
+        weights  = F.softmax(self.score(x).squeeze(-1), dim=-1)  # (B, T)
+        soft     = (x * weights.unsqueeze(-1)).sum(1)             # (B, D)
         mean_out = x.mean(1)
         max_out  = x.max(1).values
-        return torch.cat([soft, mean_out, max_out], dim=-1)
+        return torch.cat([soft, mean_out, max_out], dim=-1)       # (B, D*3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  UNCERTAINTY-AWARE OUTPUT HEAD
+# 7.  CLASSIFICATION HEAD
 # ─────────────────────────────────────────────────────────────────────────────
 
-class UncertaintyHead(nn.Module):
+class ClassificationHead(nn.Module):
     """
-    Outputs point prediction (mu) + log-variance for Gaussian NLL training.
+    Two-layer GELU MLP -> single logit.
+    Use BCEWithLogitsLoss in trainer (applies sigmoid internally).
+    At inference use torch.sigmoid(model(x)) to get probability.
     """
     def __init__(self, in_features, fc_hidden, dropout=0.2):
         super().__init__()
-        self.shared = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(in_features, fc_hidden * 2),
             nn.LayerNorm(fc_hidden * 2),
             nn.GELU(),
@@ -263,17 +268,11 @@ class UncertaintyHead(nn.Module):
             nn.LayerNorm(fc_hidden),
             nn.GELU(),
             nn.Dropout(dropout / 2),
+            nn.Linear(fc_hidden, 1),
         )
-        self.mu      = nn.Linear(fc_hidden, 1)
-        self.log_var = nn.Linear(fc_hidden, 1)
 
-    def forward(self, x, return_uncertainty=False):
-        h       = self.shared(x)
-        mu      = self.mu(h).squeeze(-1)
-        log_var = self.log_var(h).squeeze(-1)
-        if return_uncertainty:
-            return mu, log_var
-        return mu
+    def forward(self, x):
+        return self.net(x).squeeze(-1)   # (B,)  raw logit
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,46 +281,45 @@ class UncertaintyHead(nn.Module):
 
 class PSXLSTMModel(nn.Module):
     """
-    Full architecture:
-      FourierTemporalEncoding
-      -> GatedProjection
-      -> MultiScaleLSTMTower  (short / mid / long)
-      -> CrossScaleAttention  (per scale)
-      -> TemporalAttention    (per scale, with relative position bias)
-      -> Hierarchical fusion  (learned gate across scales)
-      -> LearnableTemporalPool (soft + mean + max)
-      -> UncertaintyHead
+    Full architecture — see module docstring for details.
+
+    Parameters
+    ----------
+    input_size  : number of input features (default 31)
+    hidden_size : LSTM hidden dimension    (default 256)
+    num_layers  : base LSTM depth          (default 4)
+    dropout     : dropout rate            (default 0.3)
+    fc_hidden   : FC head hidden dim      (default 256)
+    num_heads   : temporal attention heads (default 8)
+    cross_heads : cross-scale attn heads  (default 4)
     """
 
-    def __init__(self, input_size=50, hidden_size=256,
+    def __init__(self, input_size=31, hidden_size=256,
                  num_layers=4, dropout=0.3, fc_hidden=256,
                  num_heads=8, cross_heads=4):
         super().__init__()
         D = hidden_size
 
-        self.temporal_enc = FourierTemporalEncoding(D)
         self.input_proj   = GatedProjection(input_size, D, dropout)
-
-        self.ms_lstm  = MultiScaleLSTMTower(D, hidden_size, num_layers, dropout)
-        n_scales      = self.ms_lstm.n_scales
+        self.temporal_enc = FourierTemporalEncoding(D)
+        self.ms_lstm      = MultiScaleLSTMTower(D, hidden_size, num_layers, dropout)
+        n_scales          = self.ms_lstm.n_scales
 
         self.cross_attn = nn.ModuleList([
             CrossScaleAttention(D, num_heads=cross_heads, dropout=dropout)
             for _ in range(n_scales)
         ])
-
         self.temp_attn = nn.ModuleList([
             TemporalAttention(D, num_heads=num_heads, dropout=dropout)
             for _ in range(n_scales)
         ])
-
         self.scale_gate = nn.Sequential(
             nn.Linear(D * n_scales, n_scales),
             nn.Softmax(dim=-1),
         )
 
         self.pool = LearnableTemporalPool(D)
-        self.head = UncertaintyHead(D * 3, fc_hidden, dropout)
+        self.head = ClassificationHead(D * 3, fc_hidden, dropout)
 
         self._init_weights()
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -339,181 +337,222 @@ class PSXLSTMModel(nn.Module):
             elif "bias" in name:
                 nn.init.zeros_(param)
 
-    def forward(self, x, return_uncertainty=False):
+    def encode(self, x):
         """
+        Returns pooled representation before the classification head.
+        Used by TreeEnsemble to extract features for XGBoost / RF.
+
         Parameters
         ----------
-        x                  : (B, seq_len, input_size)
-        return_uncertainty : if True, also returns log-variance tensor
+        x : (B, seq_len, input_size)
 
         Returns
         -------
-        mu      : (B,)
-        log_var : (B,)   only when return_uncertainty=True
+        pooled : (B, hidden_size * 3)
         """
-        x = self.input_proj(x)
-        x = self.temporal_enc(x)
-
+        x          = self.input_proj(x)
+        x          = self.temporal_enc(x)
         scale_outs = self.ms_lstm(x)
 
-        cross_outs = []
-        for i, ca in enumerate(self.cross_attn):
-            others = [scale_outs[j] for j in range(len(scale_outs)) if j != i]
-            cross_outs.append(ca(scale_outs[i], others))
+        cross_outs = [
+            self.cross_attn[i](
+                scale_outs[i],
+                [scale_outs[j] for j in range(len(scale_outs)) if j != i]
+            )
+            for i in range(len(scale_outs))
+        ]
+        attn_outs = [self.temp_attn[i](cross_outs[i]) for i in range(len(cross_outs))]
 
-        attn_outs = [self.temp_attn[i](cross_outs[i])
-                     for i in range(len(cross_outs))]
+        stacked = torch.stack(attn_outs, dim=-1)                      # (B, T, D, S)
+        gates   = self.scale_gate(torch.cat(attn_outs, dim=-1))       # (B, T, S)
+        fused   = (stacked * gates.unsqueeze(2)).sum(-1)              # (B, T, D)
+        return self.pool(fused)                                        # (B, D*3)
 
-        stacked = torch.stack(attn_outs, dim=-1)
-        B, T, D, S = stacked.shape
-        cat   = torch.cat(attn_outs, dim=-1)
-        gates = self.scale_gate(cat).unsqueeze(2)
-        fused = (stacked * gates).sum(-1)
+    def forward(self, x):
+        """
+        Parameters
+        ----------
+        x : (B, seq_len, input_size)
 
-        pooled = self.pool(fused)
-        return self.head(pooled, return_uncertainty)
+        Returns
+        -------
+        logit : (B,)  raw logit — pass to BCEWithLogitsLoss during training
+                      use torch.sigmoid(logit) to get probability at inference
+        """
+        return self.head(self.encode(x))
+
+    @torch.no_grad()
+    def predict_proba(self, x):
+        """Convenience method for inference. Returns UP probability (B,)."""
+        self.eval()
+        return torch.sigmoid(self.forward(x))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9.  TREE-BASED ENSEMBLE WRAPPER  (XGBoost + RandomForest)
+# 9.  TREE ENSEMBLE  (XGBoost + RandomForest + LR meta-learner)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TreeEnsemble:
     """
-    Trains XGBoost and RandomForest on pooled LSTM features, then blends
-    all three predictions with a Ridge meta-learner (stacking).
+    Stacking ensemble on top of a trained PSXLSTMModel.
+
+    Stage 1 — XGBoost + RandomForest trained on LSTM encode() features
+               from the TRAIN set.
+    Stage 2 — Logistic Regression meta-learner trained on VAL set
+               probabilities [lstm_prob, xgb_prob, rf_prob] to avoid leakage.
 
     Usage
     -----
     ensemble = TreeEnsemble(lstm_model, cfg)
-    ensemble.fit(train_loader, device)
-    preds = ensemble.predict(val_loader, device)
+    ensemble.fit(train_loader, val_loader, device)
+    probs = ensemble.predict_proba(test_loader, device)   # (N,)
+    preds = ensemble.predict(test_loader, device)         # (N,) binary
     """
 
     def __init__(self, lstm_model, cfg):
-        from xgboost import XGBRegressor
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.linear_model import Ridge
+        from xgboost import XGBClassifier
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.linear_model import LogisticRegression
 
-        m = cfg.get("model", {})
+        m         = cfg.get("model", {})
         self.lstm = lstm_model
-        self.xgb  = XGBRegressor(
-            n_estimators     = m.get("xgb_trees",  1000),
-            max_depth        = m.get("xgb_depth",     6),
-            learning_rate    = m.get("xgb_lr",      0.02),
+
+        self.xgb = XGBClassifier(
+            n_estimators     = m.get("xgb_trees", 500),
+            max_depth        = m.get("xgb_depth", 6),
+            learning_rate    = m.get("xgb_lr", 0.02),
             subsample        = 0.8,
             colsample_bytree = 0.8,
             min_child_weight = 3,
             reg_alpha        = 0.1,
             reg_lambda       = 1.0,
-            tree_method      = "hist",
+            eval_metric      = "logloss",
             random_state     = 42,
+            verbosity        = 0,
         )
-        self.rf   = RandomForestRegressor(
-            n_estimators = m.get("rf_trees", 500),
-            max_depth    = m.get("rf_depth",  14),
+        self.rf = RandomForestClassifier(
+            n_estimators = m.get("rf_trees", 300),
+            max_depth    = m.get("rf_depth", 14),
             max_features = 0.6,
             n_jobs       = -1,
             random_state = 42,
         )
-        self.meta = Ridge(alpha=1.0)
+        # Meta-learner: 3 inputs (lstm_prob, xgb_prob, rf_prob) -> direction
+        self.meta = LogisticRegression(C=1.0, max_iter=1000)
 
     @torch.no_grad()
-    def _extract_features(self, loader, device):
+    def _get_features_and_probs(self, loader, device):
+        """
+        Returns encoded features, lstm probabilities, and true labels
+        for all batches in a loader.
+        """
         self.lstm.eval()
-        feats, targets = [], []
+        feats, probs, targets = [], [], []
         for xb, yb in loader:
             xb = xb.to(device)
-            x  = self.lstm.input_proj(xb)
-            x  = self.lstm.temporal_enc(x)
-            sc = self.lstm.ms_lstm(x)
-            co = [self.lstm.cross_attn[i](sc[i],
-                  [sc[j] for j in range(len(sc)) if j != i])
-                  for i in range(len(sc))]
-            ao = [self.lstm.temp_attn[i](co[i]) for i in range(len(co))]
-            st = torch.stack(ao, dim=-1)
-            B, T, D, S = st.shape
-            ga = self.lstm.scale_gate(torch.cat(ao, dim=-1)).unsqueeze(2)
-            fu = (st * ga).sum(-1)
-            po = self.lstm.pool(fu)
-            feats.append(po.cpu().numpy())
-            targets.append(yb.cpu().numpy())
-        return np.concatenate(feats), np.concatenate(targets)
+            feats.append(self.lstm.encode(xb).cpu().numpy())
+            probs.append(torch.sigmoid(self.lstm(xb)).cpu().numpy())
+            targets.append(yb.numpy())
+        return (
+            np.concatenate(feats),     # (N, D*3)
+            np.concatenate(probs),     # (N,)
+            np.concatenate(targets),   # (N,)
+        )
 
-    def fit(self, train_loader, device):
-        log.info("Extracting LSTM features for tree ensemble ...")
-        X, y = self._extract_features(train_loader, device)
-        log.info("Fitting XGBoost on %d samples, %d features ...", *X.shape)
-        self.xgb.fit(X, y)
+    def fit(self, train_loader, val_loader, device):
+        """
+        Train XGB + RF on train encoded features.
+        Train meta-learner on val set probabilities (avoids leakage).
+        """
+        log.info("TreeEnsemble.fit — extracting train features ...")
+        X_train, _, y_train = self._get_features_and_probs(train_loader, device)
+
+        log.info("Fitting XGBoost on %d samples, %d features ...", *X_train.shape)
+        self.xgb.fit(X_train, y_train)
+
         log.info("Fitting RandomForest ...")
-        self.rf.fit(X, y)
-        p_xgb  = self.xgb.predict(X).reshape(-1, 1)
-        p_rf   = self.rf.predict(X).reshape(-1, 1)
-        with torch.no_grad():
-            p_lstm = []
-            for xb, _ in train_loader:
-                p_lstm.append(self.lstm(xb.to(device)).cpu().numpy())
-        p_lstm = np.concatenate(p_lstm).reshape(-1, 1)
-        meta_X = np.hstack([p_lstm, p_xgb, p_rf])
-        self.meta.fit(meta_X, y)
-        log.info("Meta-learner fitted. Blend coefs: %s", self.meta.coef_.round(3))
+        self.rf.fit(X_train, y_train)
 
-    def predict(self, loader, device):
-        X, _ = self._extract_features(loader, device)
-        p_xgb  = self.xgb.predict(X).reshape(-1, 1)
-        p_rf   = self.rf.predict(X).reshape(-1, 1)
-        with torch.no_grad():
-            p_lstm = []
-            for xb, _ in loader:
-                p_lstm.append(self.lstm(xb.to(device)).cpu().numpy())
-        p_lstm = np.concatenate(p_lstm).reshape(-1, 1)
-        meta_X = np.hstack([p_lstm, p_xgb, p_rf])
-        return self.meta.predict(meta_X)
+        log.info("Building meta-features on val set ...")
+        X_val, lstm_val_prob, y_val = self._get_features_and_probs(val_loader, device)
 
+        xgb_val_prob = self.xgb.predict_proba(X_val)[:, 1]
+        rf_val_prob  = self.rf.predict_proba(X_val)[:, 1]
+        meta_val     = np.stack([lstm_val_prob, xgb_val_prob, rf_val_prob], axis=1)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10.  GAUSSIAN NLL LOSS
-# ─────────────────────────────────────────────────────────────────────────────
+        log.info("Fitting meta-learner on %d val samples ...", len(y_val))
+        self.meta.fit(meta_val, y_val)
 
-def gaussian_nll_loss(mu, log_var, target):
-    """
-    Gaussian negative log-likelihood loss.
-    Penalises wrong predictions AND miscalibrated uncertainty.
-    Use when return_uncertainty=True.
-    """
-    var = torch.exp(log_var).clamp(min=1e-6)
-    return (0.5 * (log_var + (target - mu) ** 2 / var)).mean()
+        coefs = self.meta.coef_[0]
+        log.info(
+            "Meta-learner coefs — LSTM: %.3f  XGB: %.3f  RF: %.3f",
+            coefs[0], coefs[1], coefs[2],
+        )
+
+    def predict_proba(self, loader, device):
+        """Returns blended UP probability. Shape: (N,)"""
+        X_enc, lstm_prob, _ = self._get_features_and_probs(loader, device)
+        xgb_prob  = self.xgb.predict_proba(X_enc)[:, 1]
+        rf_prob   = self.rf.predict_proba(X_enc)[:, 1]
+        meta_X    = np.stack([lstm_prob, xgb_prob, rf_prob], axis=1)
+        return self.meta.predict_proba(meta_X)[:, 1]
+
+    def predict(self, loader, device, threshold=0.5):
+        """Returns binary predictions (0=DOWN, 1=UP). Shape: (N,)"""
+        return (self.predict_proba(loader, device) >= threshold).astype(int)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11.  BUILD FUNCTIONS
+# 10.  BUILD FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_model(cfg):
+    """
+    Instantiates PSXLSTMModel from config.yaml model section.
+
+    Parameters
+    ----------
+    cfg : dict  (loaded config.yaml)
+
+    Returns
+    -------
+    PSXLSTMModel
+    """
     m     = cfg.get("model", {})
     model = PSXLSTMModel(
-        input_size  = m.get("input_size",   50),
+        input_size  = m.get("input_size",   31),
         hidden_size = m.get("lstm_hidden",  256),
-        num_layers  = m.get("lstm_layers",    4),
+        num_layers  = m.get("lstm_layers",   4),
         dropout     = m.get("lstm_dropout", 0.3),
         fc_hidden   = m.get("fc_hidden",    256),
-        num_heads   = m.get("num_heads",      8),
-        cross_heads = m.get("cross_heads",    4),
+        num_heads   = m.get("num_heads",     8),
+        cross_heads = m.get("cross_heads",   4),
     )
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info("Model built: Deep Hierarchical LSTM  |  trainable params: %s", f"{n:,}")
+    log.info("Model built: PSXLSTMModel | trainable params: %s", f"{n:,}")
     return model
 
 
-def build_ensemble(cfg, lstm_model, train_loader, device):
+def build_ensemble(cfg, lstm_model, train_loader, val_loader, device):
     """
-    Wraps a trained PSXLSTMModel with XGBoost + RF ensemble.
+    Wraps a trained PSXLSTMModel with XGBoost + RF + LR stacking ensemble.
     Call AFTER lstm_model has been fully trained.
-    Returns TreeEnsemble or None if use_ensemble=false in config.
+
+    Parameters
+    ----------
+    cfg          : dict  (loaded config.yaml)
+    lstm_model   : trained PSXLSTMModel
+    train_loader : DataLoader for training split
+    val_loader   : DataLoader for validation split (used for meta-learner)
+    device       : torch.device
+
+    Returns
+    -------
+    TreeEnsemble or None if use_ensemble=false in config
     """
     if not cfg.get("model", {}).get("use_ensemble", False):
-        log.info("Ensemble disabled in config — returning None.")
+        log.info("Ensemble disabled in config — skipping.")
         return None
     ensemble = TreeEnsemble(lstm_model, cfg)
-    ensemble.fit(train_loader, device)
+    ensemble.fit(train_loader, val_loader, device)
     return ensemble
