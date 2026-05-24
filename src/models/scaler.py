@@ -1,30 +1,34 @@
 """
 src/models/scaler.py
 ======================
-Per-ticker MinMaxScaler that is fit ONLY on training data.
+Per-ticker StandardScaler that is fit ONLY on training data.
 
 Why per-ticker?
   Even though all features are scale-free (ratios, % changes,
   bounded oscillators), each ticker still has its own distribution
-  of values. OGDC turbulence spikes look different from LUCK turbulence
-  spikes. A per-ticker scaler tightens each feature into [0, 1]
-  relative to that ticker's own history — no cross-ticker leakage.
+  of values. A per-ticker scaler normalizes each feature relative
+  to that ticker's own training history — no cross-ticker leakage.
+
+Why StandardScaler over MinMaxScaler?
+  Features like news_count (0-25), turbulence (0-20), and rsi (0-100)
+  have skewed distributions with outliers. MinMaxScaler compresses most
+  values into a small range when outliers are present. StandardScaler
+  (zero mean, unit variance) spreads values more evenly, giving the
+  LSTM cleaner gradient signals.
 
 Why fit on train only?
-  Fitting on the full dataset would let future information (test period
-  min/max) influence the scaling of past data. We fit strictly on the
+  Fitting on the full dataset leaks future information (test period
+  statistics) into the scaling of past data. We fit strictly on the
   training window and apply the same transform to val and test.
 
-What gets scaled?
-  Every column in FEATURE_COLS from features.py.
-  The TARGET_COL (ret_1d_future) is scaled separately so we can
-  inverse-transform predictions back to real return values.
+Why no target scaler?
+  Target is binary (0 = DOWN, 1 = UP). Scaling 0/1 is meaningless
+  and breaks BCELoss. Target is kept as raw integers.
 
 Saved artefacts  (one file per ticker)
-  data/processed/<TICKER>_scaler.pkl   — dict with
+  data/scalers/<TICKER>_scaler.pkl   — dict with
       {
-        "feature_scaler": fitted MinMaxScaler on features,
-        "target_scaler":  fitted MinMaxScaler on target,
+        "feature_scaler": fitted StandardScaler on features,
         "feature_cols":   list of feature column names,
         "target_col":     target column name,
         "train_end_date": last date in the training window,
@@ -36,14 +40,12 @@ import logging
 import pickle
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 
 log = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Train / Val / Test split
-# =============================================================================
+# ── Train / Val / Test split ──────────────────────────────────────────────────
 
 def split_by_date(df, train_ratio=0.7, val_ratio=0.15):
     """
@@ -55,15 +57,9 @@ def split_by_date(df, train_ratio=0.7, val_ratio=0.15):
       val   : val_ratio            (default 15%)
       test  : 1 - train - val      (default 15%)
 
-    Parameters
-    ----------
-    df          : output of features.build_features() for one ticker
-    train_ratio : fraction of rows for training
-    val_ratio   : fraction of rows for validation
-
     Returns
     -------
-    train_df, val_df, test_df  — three non-overlapping DataFrames
+    train_df, val_df, test_df
     """
     n       = len(df)
     i_train = int(n * train_ratio)
@@ -74,8 +70,7 @@ def split_by_date(df, train_ratio=0.7, val_ratio=0.15):
     test_df  = df.iloc[i_val:].copy()
 
     log.info(
-        "Split -> train=%d  val=%d  test=%d  "
-        "(train_end=%s  test_start=%s)",
+        "Split -> train=%d  val=%d  test=%d  (train_end=%s  test_start=%s)",
         len(train_df), len(val_df), len(test_df),
         train_df["date"].iloc[-1].date() if "date" in train_df.columns else "?",
         test_df["date"].iloc[0].date()   if "date" in test_df.columns  else "?",
@@ -83,102 +78,81 @@ def split_by_date(df, train_ratio=0.7, val_ratio=0.15):
     return train_df, val_df, test_df
 
 
-# =============================================================================
-# Fit scaler on train, transform all splits
-# =============================================================================
+# ── Fit scaler on train ───────────────────────────────────────────────────────
 
-def fit_scalers(train_df, feature_cols, target_col):
+def fit_scaler(train_df, feature_cols):
     """
-    Fits two MinMaxScalers on the training data only.
+    Fits a StandardScaler on training data only.
 
     Returns
     -------
-    feature_scaler : fitted on feature_cols
-    target_scaler  : fitted on target_col  (needed for inverse transform)
+    feature_scaler : fitted StandardScaler
     """
-    feature_scaler = MinMaxScaler(feature_range=(0, 1))
-    target_scaler  = MinMaxScaler(feature_range=(0, 1))
-
+    feature_scaler = StandardScaler()
     feature_scaler.fit(train_df[feature_cols].values)
-    target_scaler.fit(train_df[[target_col]].values)
-
     log.info(
-        "Scalers fit on %d training rows  "
-        "(%d feature cols + 1 target col)",
-        len(train_df), len(feature_cols)
+        "StandardScaler fit on %d training rows (%d feature cols)",
+        len(train_df), len(feature_cols),
     )
-    return feature_scaler, target_scaler
+    return feature_scaler
 
 
-def transform_split(df, feature_scaler, target_scaler,
-                    feature_cols, target_col):
+# ── Transform a split ─────────────────────────────────────────────────────────
+
+def transform_split(df, feature_scaler, feature_cols, target_col):
     """
-    Applies already-fitted scalers to a DataFrame split.
-    Returns a new DataFrame with scaled values.
-    Original "date" and "close" columns are preserved unscaled
-    so they can be used for plotting / inverse transform later.
+    Applies already-fitted scaler to a DataFrame split.
+    Target column is kept as raw 0/1 — not scaled.
+    date and close columns are preserved unscaled.
+
+    Returns
+    -------
+    New DataFrame with scaled features, raw target.
     """
-    df = df.copy()
-
-    scaled_features             = feature_scaler.transform(
-                                      df[feature_cols].values)
-    df[feature_cols]            = scaled_features
-
-    scaled_target               = target_scaler.transform(
-                                      df[[target_col]].values)
-    df[target_col]              = scaled_target.flatten()
-
+    df                = df.copy()
+    df[feature_cols]  = feature_scaler.transform(df[feature_cols].values)
     return df
 
+
+# ── Full pipeline for one ticker ──────────────────────────────────────────────
 
 def scale_ticker(df, feature_cols, target_col,
                  train_ratio=0.7, val_ratio=0.15):
     """
     Full pipeline for one ticker:
-      1. Split into train / val / test
-      2. Fit scalers on train
+      1. Split into train / val / test by date
+      2. Fit StandardScaler on train only
       3. Transform all three splits
 
     Returns
     -------
-    train_scaled, val_scaled, test_scaled : DataFrames with scaled values
-    feature_scaler, target_scaler         : fitted scaler objects
+    train_scaled, val_scaled, test_scaled : DataFrames with scaled features
+    feature_scaler                         : fitted StandardScaler
     """
     train_df, val_df, test_df = split_by_date(
-        df, train_ratio=train_ratio, val_ratio=val_ratio
+        df, train_ratio=train_ratio, val_ratio=val_ratio,
     )
 
-    feature_scaler, target_scaler = fit_scalers(
-        train_df, feature_cols, target_col
-    )
+    feature_scaler = fit_scaler(train_df, feature_cols)
 
-    train_scaled = transform_split(
-        train_df, feature_scaler, target_scaler, feature_cols, target_col
-    )
-    val_scaled   = transform_split(
-        val_df,   feature_scaler, target_scaler, feature_cols, target_col
-    )
-    test_scaled  = transform_split(
-        test_df,  feature_scaler, target_scaler, feature_cols, target_col
-    )
+    train_scaled = transform_split(train_df, feature_scaler, feature_cols, target_col)
+    val_scaled   = transform_split(val_df,   feature_scaler, feature_cols, target_col)
+    test_scaled  = transform_split(test_df,  feature_scaler, feature_cols, target_col)
 
-    return train_scaled, val_scaled, test_scaled, feature_scaler, target_scaler
+    return train_scaled, val_scaled, test_scaled, feature_scaler
 
 
-# =============================================================================
-# Save and load scaler artefacts
-# =============================================================================
+# ── Save and load scaler artefacts ────────────────────────────────────────────
 
-def save_scalers(ticker, feature_scaler, target_scaler,
-                 feature_cols, target_col, train_end_date, out_dir):
+def save_scaler(ticker, feature_scaler, feature_cols,
+                target_col, train_end_date, out_dir):
     """
-    Saves both scalers and metadata to a single pickle file.
-    One file per ticker:  <out_dir>/<TICKER>_scaler.pkl
+    Saves scaler and metadata to a single pickle file.
+    One file per ticker: <out_dir>/<TICKER>_scaler.pkl
     """
     os.makedirs(out_dir, exist_ok=True)
     artefact = {
         "feature_scaler": feature_scaler,
-        "target_scaler":  target_scaler,
         "feature_cols":   feature_cols,
         "target_col":     target_col,
         "train_end_date": train_end_date,
@@ -190,15 +164,13 @@ def save_scalers(ticker, feature_scaler, target_scaler,
     return path
 
 
-def load_scalers(ticker, out_dir):
+def load_scaler(ticker, out_dir):
     """
     Loads scaler artefact for a ticker.
 
     Returns
     -------
-    dict with keys:
-        feature_scaler, target_scaler,
-        feature_cols, target_col, train_end_date
+    dict with keys: feature_scaler, feature_cols, target_col, train_end_date
     """
     path = os.path.join(out_dir, f"{ticker}_scaler.pkl")
     if not os.path.exists(path):
@@ -209,30 +181,7 @@ def load_scalers(ticker, out_dir):
     return artefact
 
 
-# =============================================================================
-# Inverse transform  (predictions -> real return values)
-# =============================================================================
-
-def inverse_transform_target(scaled_values, target_scaler):
-    """
-    Converts scaled predictions back to real log-return values.
-
-    Parameters
-    ----------
-    scaled_values : np.array of shape (N,) or (N, 1)
-    target_scaler : fitted MinMaxScaler for the target column
-
-    Returns
-    -------
-    np.array of shape (N,)  in original log-return scale
-    """
-    scaled_values = np.array(scaled_values).reshape(-1, 1)
-    return target_scaler.inverse_transform(scaled_values).flatten()
-
-
-# =============================================================================
-# Run for all tickers  (called from pipeline.py)
-# =============================================================================
+# ── Run for all tickers ───────────────────────────────────────────────────────
 
 def run(features_dict, feature_cols, target_col,
         out_dir, train_ratio=0.7, val_ratio=0.15):
@@ -241,17 +190,17 @@ def run(features_dict, feature_cols, target_col,
 
     Parameters
     ----------
-    features_dict : dict  { ticker -> DataFrame from features.build_features() }
-    feature_cols  : list of feature column names  (FEATURE_COLS from features.py)
-    target_col    : target column name            (TARGET_COL  from features.py)
+    features_dict : dict  { ticker -> DataFrame from features.run() }
+    feature_cols  : FEATURE_COLS from features.py
+    target_col    : TARGET_COL   from features.py
     out_dir       : directory to save scaler pkl files
-    train_ratio   : fraction of data for training
-    val_ratio     : fraction of data for validation
+    train_ratio   : fraction of data for training   (default 0.70)
+    val_ratio     : fraction of data for validation (default 0.15)
 
     Returns
     -------
     scaled_dict : dict  { ticker -> (train_scaled, val_scaled, test_scaled) }
-    scaler_dict : dict  { ticker -> (feature_scaler, target_scaler) }
+    scaler_dict : dict  { ticker -> feature_scaler }
     """
     scaled_dict = {}
     scaler_dict = {}
@@ -259,12 +208,12 @@ def run(features_dict, feature_cols, target_col,
     for ticker, df in features_dict.items():
         log.info("Scaling ticker: %s  (%d rows)", ticker, len(df))
 
-        train_s, val_s, test_s, feat_sc, tgt_sc = scale_ticker(
+        train_s, val_s, test_s, feat_sc = scale_ticker(
             df,
-            feature_cols  = feature_cols,
-            target_col    = target_col,
-            train_ratio   = train_ratio,
-            val_ratio     = val_ratio,
+            feature_cols = feature_cols,
+            target_col   = target_col,
+            train_ratio  = train_ratio,
+            val_ratio    = val_ratio,
         )
 
         train_end = (
@@ -272,10 +221,9 @@ def run(features_dict, feature_cols, target_col,
             if "date" in train_s.columns else None
         )
 
-        save_scalers(
+        save_scaler(
             ticker         = ticker,
             feature_scaler = feat_sc,
-            target_scaler  = tgt_sc,
             feature_cols   = feature_cols,
             target_col     = target_col,
             train_end_date = train_end,
@@ -283,51 +231,11 @@ def run(features_dict, feature_cols, target_col,
         )
 
         scaled_dict[ticker] = (train_s, val_s, test_s)
-        scaler_dict[ticker] = (feat_sc, tgt_sc)
+        scaler_dict[ticker] = feat_sc
 
-    log.info("Scaling complete for %d tickers.", len(features_dict))
+    log.info("Scaling complete for %d tickers.", len(scaled_dict))
     return scaled_dict, scaler_dict
 
 
-# =============================================================================
-# Smoke-test
-# =============================================================================
-
 if __name__ == "__main__":
-    import yfinance as yf
-    from feature_engineering.indicators import add_all_indicators
-    from feature_engineering.features   import build_features, FEATURE_COLS, TARGET_COL
-
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s  %(levelname)s  %(message)s")
-
-    raw = yf.download("OGDC.KA", start="2020-01-01", end="2024-12-31",
-                      auto_adjust=True, progress=False)
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = [c[0].lower() for c in raw.columns]
-    else:
-        raw.columns = [c.lower() for c in raw.columns]
-    raw = raw[["open","high","low","close","volume"]].dropna()
-    raw = raw.reset_index().rename(columns={"Date":"date","index":"date"})
-    raw["date"] = pd.to_datetime(raw["date"])
-
-    df_feat = build_features(add_all_indicators(raw), sentiment_df=None)
-
-    train_s, val_s, test_s, feat_sc, tgt_sc = scale_ticker(
-        df_feat, FEATURE_COLS, TARGET_COL
-    )
-
-    print(f"Train : {len(train_s)} rows")
-    print(f"Val   : {len(val_s)}   rows")
-    print(f"Test  : {len(test_s)}  rows")
-
-    print("\nScaled feature ranges (should all be within [0, 1]):")
-    for col in FEATURE_COLS[:6]:
-        s = train_s[col]
-        print(f"  {col:30s}  min={s.min():.4f}  max={s.max():.4f}")
-
-    print("\nInverse-transform test:")
-    dummy = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
-    real  = inverse_transform_target(dummy, tgt_sc)
-    print(f"  scaled -> {dummy}")
-    print(f"  real   -> {np.round(real, 6)}")
+    run()
