@@ -3,7 +3,7 @@ src/feature_engineering/features.py
 =====================================
 Builds the final feature matrix for the LSTM model.
 
-Feature set (32 features)
+Feature set (33 features)
 --------------------------
   Momentum        : ret_1d, ret_5d, ret_10d, ret_20d
   Indicators      : rsi, macd, bb_pct, bb_width, turbulence
@@ -15,7 +15,7 @@ Feature set (32 features)
   Circuit         : near_upper_circuit, near_lower_circuit
   Calendar        : day_of_week, month
   Sentiment       : sentiment_macro, sentiment_energy, news_count,
-                    sentiment_ticker  (per-ticker, falls back to category)
+                    sentiment_ticker, has_ticker_news
 
 Target
 ------
@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BASE         = os.path.join(PROJECT_ROOT, "data")
 
-THRESHOLD = 0.01   # +-1% noise filter on 5-day forward return
+THRESHOLD = 0.01
 
 FEATURE_COLS = [
     "ret_1d", "ret_5d", "ret_10d", "ret_20d",
@@ -58,7 +58,7 @@ FEATURE_COLS = [
     "near_upper_circuit", "near_lower_circuit",
     "day_of_week", "month",
     "sentiment_macro", "sentiment_energy", "news_count",
-    "sentiment_ticker",
+    "sentiment_ticker", "has_ticker_news",
 ]
 
 TARGET_COL = "target"
@@ -72,7 +72,7 @@ def _push_to_github(decay_path, flags_path):
             ["git", "-C", PROJECT_ROOT, "pull", "--rebase", "origin", "main"],
             ["git", "-C", PROJECT_ROOT, "add", decay_path, flags_path],
             ["git", "-C", PROJECT_ROOT, "commit", "-m",
-             "Update features: add sentiment_ticker (32 features)"],
+             "Update features: 33 features, add has_ticker_news flag"],
             ["git", "-C", PROJECT_ROOT, "push"],
         ]
         for cmd in cmds:
@@ -137,11 +137,14 @@ def _build_ticker_features(df):
     df["day_of_week"] = pd.to_datetime(df["date"]).dt.dayofweek
     df["month"]       = pd.to_datetime(df["date"]).dt.month
 
-    # ── sentiment_ticker: clip to [-1, 1], fill missing with 0
+    # ── Ticker sentiment + presence flag
     if "sentiment_ticker" in df.columns:
-        df["sentiment_ticker"] = df["sentiment_ticker"].clip(-1.0, 1.0).fillna(0.0)
+        raw = df["sentiment_ticker"]
+        df["has_ticker_news"]  = raw.notna().astype(float)
+        df["sentiment_ticker"] = raw.clip(-1.0, 1.0).fillna(0.0)
     else:
         df["sentiment_ticker"] = 0.0
+        df["has_ticker_news"]  = 0.0
 
     # ── Target: 5-day forward direction with +-1% noise filter
     df["next_ret"] = np.log(df["close"].shift(-5) / df["close"])
@@ -167,28 +170,24 @@ def _build(input_path, output_path, label):
 
     df = pd.concat(frames, ignore_index=True)
 
-    # ── Drop NaNs on feature + target cols
     before = len(df)
     df     = df.dropna(subset=FEATURE_COLS + [TARGET_COL])
     log.info("%s: %d -> %d rows after dropna (dropped %d)",
              label, before, len(df), before - len(df))
 
-    # ── Keep only useful columns
     id_cols   = ["date", "ticker", "close"]
     keep_cols = id_cols + FEATURE_COLS + [TARGET_COL]
     df        = df[keep_cols].sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    # ── Summary
     log.info("%s: %d rows | %d tickers | %d features",
              label, len(df), df["ticker"].nunique(), len(FEATURE_COLS))
     log.info("%s: Target UP %.1f%% | DOWN %.1f%%",
              label, df[TARGET_COL].mean()*100, (1-df[TARGET_COL].mean())*100)
-    log.info("%s: sentiment_ticker — mean=%.4f  zeros=%.1f%%",
+    log.info("%s: sentiment_ticker zeros=%.1f%%  has_ticker_news mean=%.3f",
              label,
-             df["sentiment_ticker"].mean(),
-             (df["sentiment_ticker"] == 0).mean() * 100)
+             (df["sentiment_ticker"] == 0).mean() * 100,
+             df["has_ticker_news"].mean())
 
-    # ── Save
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df.to_csv(output_path, index=False)
     log.info("%s: Saved -> %s (%.1f MB)",
