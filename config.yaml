@@ -46,46 +46,37 @@ data:
 features:
   input_file_decay: "data/processed/features_decay.csv"
   input_file_flags: "data/processed/features_flags.csv"
-  use_flags:        false          # true = use features_flags, false = features_decay
-  noise_threshold:  0.005          # ±0.5% filter applied in features.py
+  use_flags:        false
+  noise_threshold:  0.005
   cols:
-    # ── Momentum ──────────────────────────────────────────
     - "ret_1d"
     - "ret_5d"
     - "ret_10d"
     - "ret_20d"
-    # ── Indicators ────────────────────────────────────────
     - "rsi"
     - "macd"
     - "bb_pct"
     - "bb_width"
     - "turbulence"
-    # ── Trend ratios (scale-free) ─────────────────────────
     - "close_to_ema9"
     - "close_to_ema21"
     - "close_to_ema50"
-    # ── Price structure ───────────────────────────────────
     - "close_to_high"
     - "close_to_low"
     - "gap_pct"
     - "high_low_range_pct"
-    # ── Volume ────────────────────────────────────────────
     - "volume_ma5_ratio"
     - "volume_ma20_ratio"
     - "vol_ratio_5_20"
     - "rolling_vol_10"
     - "rolling_vol_20"
     - "volume_trend"
-    # ── Range ─────────────────────────────────────────────
     - "52w_high_ratio"
     - "52w_low_ratio"
-    # ── Circuit breakers ──────────────────────────────────
     - "near_upper_circuit"
     - "near_lower_circuit"
-    # ── Calendar ──────────────────────────────────────────
     - "day_of_week"
     - "month"
-    # ── Sentiment ─────────────────────────────────────────
     - "sentiment_macro"
     - "sentiment_energy"
     - "news_count"
@@ -95,13 +86,13 @@ features:
 model:
   input_size:      31
   seq_len:         30
-  lstm_hidden:     128
-  lstm_layers:     2
-  lstm_dropout:    0.4
-  num_heads:       4
-  cross_heads:     2
-  fc_hidden:       128
-  use_ensemble:    true
+  lstm_hidden:     64
+  lstm_layers:     1
+  lstm_dropout:    0.3
+  num_heads:       2
+  cross_heads:     1
+  fc_hidden:       64
+  use_ensemble:    false
   xgb_trees:       300
   xgb_depth:       6
   xgb_lr:          0.02
