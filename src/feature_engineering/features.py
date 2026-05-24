@@ -18,8 +18,8 @@ Feature set (31 features)
 
 Target
 ------
-  Binary 1 (UP) / 0 (DOWN) based on next-day return with ±0.5% noise filter.
-  Rows where |next_ret| <= 0.5% are dropped as unactionable noise.
+  Binary 1 (UP) / 0 (DOWN) based on 5-day forward return with ±1% noise filter.
+  Rows where |next_5d_ret| <= 1% are dropped as unactionable noise.
 
 Inputs
 ------
@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BASE         = os.path.join(PROJECT_ROOT, "data")
 
-THRESHOLD = 0.005  # ±0.5% noise filter
+THRESHOLD = 0.01   # ±1% noise filter on 5-day forward return
 
 FEATURE_COLS = [
     "ret_1d", "ret_5d", "ret_10d", "ret_20d",
@@ -70,7 +70,7 @@ def _push_to_github(decay_path, flags_path):
             ["git", "-C", PROJECT_ROOT, "pull", "--rebase", "origin", "main"],
             ["git", "-C", PROJECT_ROOT, "add", decay_path, flags_path],
             ["git", "-C", PROJECT_ROOT, "commit", "-m",
-             "Update features_decay and features_flags"],
+             "Update features: 5-day target, 1% noise filter"],
             ["git", "-C", PROJECT_ROOT, "push"],
         ]
         for cmd in cmds:
@@ -117,8 +117,8 @@ def _build_ticker_features(df):
     df["gap_pct"]            = (df["open"] / df["ldcp"] - 1).clip(-0.5, 0.5)
 
     # ── Volume
-    vol_ma5              = df["volume"].rolling(5).mean().replace(0,  np.nan)
-    vol_ma20             = df["volume"].rolling(20).mean().replace(0, np.nan)
+    vol_ma5                 = df["volume"].rolling(5).mean().replace(0,  np.nan)
+    vol_ma20                = df["volume"].rolling(20).mean().replace(0, np.nan)
     df["volume_ma5_ratio"]  = (df["volume"] / vol_ma5).clip(0, 10)
     df["volume_ma20_ratio"] = (df["volume"] / vol_ma20).clip(0, 10)
     df["volume_trend"]      = np.log(vol_ma5 / vol_ma20.replace(0, np.nan)).clip(-2, 2)
@@ -135,8 +135,8 @@ def _build_ticker_features(df):
     df["day_of_week"] = pd.to_datetime(df["date"]).dt.dayofweek
     df["month"]       = pd.to_datetime(df["date"]).dt.month
 
-    # ── Target: next-day direction with ±0.5% noise filter
-    df["next_ret"] = np.log(df["close"].shift(-1) / df["close"])
+    # ── Target: 5-day forward direction with ±1% noise filter
+    df["next_ret"] = np.log(df["close"].shift(-5) / df["close"])
     df = df[(df["next_ret"] > THRESHOLD) | (df["next_ret"] < -THRESHOLD)].copy()
     df[TARGET_COL] = (df["next_ret"] > THRESHOLD).astype(int)
 
