@@ -29,17 +29,17 @@ config.yaml keys used
 ---------------------
   model:
     input_size:   31
-    lstm_hidden:  256
-    lstm_layers:  4
-    lstm_dropout: 0.3
-    fc_hidden:    256
-    num_heads:    8
-    cross_heads:  4
+    lstm_hidden:  128
+    lstm_layers:  2
+    lstm_dropout: 0.4
+    fc_hidden:    128
+    num_heads:    4
+    cross_heads:  2
     use_ensemble: true
-    xgb_trees:    500
+    xgb_trees:    300
     xgb_depth:    6
     xgb_lr:       0.02
-    rf_trees:     300
+    rf_trees:     200
     rf_depth:     14
 """
 
@@ -53,9 +53,7 @@ import torch.nn.functional as F
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  FOURIER TEMPORAL ENCODING
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 1. Fourier Temporal Encoding ──────────────────────────────────────────────
 
 class FourierTemporalEncoding(nn.Module):
     """
@@ -78,9 +76,9 @@ class FourierTemporalEncoding(nn.Module):
         self.proj  = nn.Linear(d_model, d_model)
 
     def forward(self, x):
-        B, T, D = x.shape
-        t = torch.arange(T, device=x.device).float().unsqueeze(1)
-        learned = torch.cat([
+        B, T, D  = x.shape
+        t        = torch.arange(T, device=x.device).float().unsqueeze(1)
+        learned  = torch.cat([
             torch.sin(t * self.freq + self.phase),
             torch.cos(t * self.freq + self.phase),
         ], dim=-1).unsqueeze(0)
@@ -88,9 +86,7 @@ class FourierTemporalEncoding(nn.Module):
         return x + encoding
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  GATED HIGHWAY FEATURE PROJECTION
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 2. Gated Highway Feature Projection ──────────────────────────────────────
 
 class GatedProjection(nn.Module):
     """
@@ -115,17 +111,15 @@ class GatedProjection(nn.Module):
         return self.norm(g * self.transform(x) + (1 - g) * self.shortcut(x))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  MULTI-SCALE LSTM TOWER
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 3. Multi-Scale LSTM Tower ─────────────────────────────────────────────────
 
 class MultiScaleLSTMTower(nn.Module):
     """
     Three independent Bidirectional LSTMs in parallel:
-      Scale 0 (short) – shallow, narrow   -> fast patterns
-      Scale 1 (mid)   – medium depth      -> medium-term momentum
-      Scale 2 (long)  – deep, wide        -> macro regime features
-    All scales project back to d_model so they can be fused uniformly.
+      Scale 0 (short) — shallow, narrow   -> fast patterns (1-5 days)
+      Scale 1 (mid)   — medium depth      -> medium momentum (5-15 days)
+      Scale 2 (long)  — deep, wide        -> macro regime (15-30 days)
+    All scales project back to d_model for uniform fusion.
     """
     def __init__(self, d_model, hidden_size, num_layers, dropout):
         super().__init__()
@@ -159,20 +153,18 @@ class MultiScaleLSTMTower(nn.Module):
         for lstm, proj in zip(self.lstms, self.projs):
             out, _ = lstm(x)
             outputs.append(proj(out))
-        return outputs   # list of 3 tensors, each (B, T, d_model)
+        return outputs   # list of 3 tensors each (B, T, d_model)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  CROSS-SCALE ATTENTION
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 4. Cross-Scale Attention ──────────────────────────────────────────────────
 
 class CrossScaleAttention(nn.Module):
     """
     Each scale acts as query; all other scales (concatenated over time)
-    act as key/value. Lets the short-term LSTM query macro regime context
-    from the long-term LSTM.
+    act as key/value. Lets short-term LSTM query macro regime context
+    from long-term LSTM and vice versa.
     """
-    def __init__(self, d_model, num_heads=4, dropout=0.1):
+    def __init__(self, d_model, num_heads=2, dropout=0.1):
         super().__init__()
         self.attn    = nn.MultiheadAttention(d_model, num_heads,
                                              dropout=dropout, batch_first=True)
@@ -180,23 +172,21 @@ class CrossScaleAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, query_scale, context_scales):
-        ctx = torch.stack(context_scales, dim=2)   # (B, T, N, D)
+        ctx        = torch.stack(context_scales, dim=2)   # (B, T, N, D)
         B, T, N, D = ctx.shape
-        ctx = ctx.view(B, T * N, D)
-        out, _ = self.attn(query_scale, ctx, ctx)
+        ctx        = ctx.view(B, T * N, D)
+        out, _     = self.attn(query_scale, ctx, ctx)
         return self.norm(query_scale + self.dropout(out))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  INTRA-SCALE TEMPORAL ATTENTION
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 5. Intra-Scale Temporal Attention ────────────────────────────────────────
 
 class TemporalAttention(nn.Module):
     """
     Multi-head self-attention over the time axis within a single scale,
     with learnable relative position bias.
     """
-    def __init__(self, d_model, num_heads=8, dropout=0.1, max_len=512):
+    def __init__(self, d_model, num_heads=4, dropout=0.1, max_len=512):
         super().__init__()
         self.attn      = nn.MultiheadAttention(d_model, num_heads,
                                                dropout=dropout, batch_first=True)
@@ -222,9 +212,7 @@ class TemporalAttention(nn.Module):
         return self.norm(x + self.dropout(out))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  LEARNABLE TEMPORAL POOLING
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 6. Learnable Temporal Pooling ─────────────────────────────────────────────
 
 class LearnableTemporalPool(nn.Module):
     """
@@ -247,9 +235,7 @@ class LearnableTemporalPool(nn.Module):
         return torch.cat([soft, mean_out, max_out], dim=-1)       # (B, D*3)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  CLASSIFICATION HEAD
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 7. Classification Head ────────────────────────────────────────────────────
 
 class ClassificationHead(nn.Module):
     """
@@ -272,12 +258,10 @@ class ClassificationHead(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)   # (B,)  raw logit
+        return self.net(x).squeeze(-1)   # (B,) raw logit
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8.  FULL DEEP LSTM MODEL
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 8. Full PSX LSTM Model ────────────────────────────────────────────────────
 
 class PSXLSTMModel(nn.Module):
     """
@@ -285,18 +269,18 @@ class PSXLSTMModel(nn.Module):
 
     Parameters
     ----------
-    input_size  : number of input features (default 31)
-    hidden_size : LSTM hidden dimension    (default 256)
-    num_layers  : base LSTM depth          (default 4)
-    dropout     : dropout rate            (default 0.3)
-    fc_hidden   : FC head hidden dim      (default 256)
-    num_heads   : temporal attention heads (default 8)
-    cross_heads : cross-scale attn heads  (default 4)
+    input_size  : number of input features  (default 31)
+    hidden_size : LSTM hidden dimension     (default 128)
+    num_layers  : base LSTM depth           (default 2)
+    dropout     : dropout rate             (default 0.4)
+    fc_hidden   : FC head hidden dim       (default 128)
+    num_heads   : temporal attention heads  (default 4)
+    cross_heads : cross-scale attn heads   (default 2)
     """
 
-    def __init__(self, input_size=31, hidden_size=256,
-                 num_layers=4, dropout=0.3, fc_hidden=256,
-                 num_heads=8, cross_heads=4):
+    def __init__(self, input_size=31, hidden_size=128,
+                 num_layers=2, dropout=0.4, fc_hidden=128,
+                 num_heads=4, cross_heads=2):
         super().__init__()
         D = hidden_size
 
@@ -322,6 +306,7 @@ class PSXLSTMModel(nn.Module):
         self.head = ClassificationHead(D * 3, fc_hidden, dropout)
 
         self._init_weights()
+
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         log.info(
             "PSXLSTMModel  input=%d  hidden=%d  layers=%d  dropout=%.2f  "
@@ -339,7 +324,7 @@ class PSXLSTMModel(nn.Module):
 
     def encode(self, x):
         """
-        Returns pooled representation before the classification head.
+        Returns pooled representation before classification head.
         Used by TreeEnsemble to extract features for XGBoost / RF.
 
         Parameters
@@ -357,16 +342,19 @@ class PSXLSTMModel(nn.Module):
         cross_outs = [
             self.cross_attn[i](
                 scale_outs[i],
-                [scale_outs[j] for j in range(len(scale_outs)) if j != i]
+                [scale_outs[j] for j in range(len(scale_outs)) if j != i],
             )
             for i in range(len(scale_outs))
         ]
-        attn_outs = [self.temp_attn[i](cross_outs[i]) for i in range(len(cross_outs))]
+        attn_outs = [
+            self.temp_attn[i](cross_outs[i])
+            for i in range(len(cross_outs))
+        ]
 
-        stacked = torch.stack(attn_outs, dim=-1)                      # (B, T, D, S)
-        gates   = self.scale_gate(torch.cat(attn_outs, dim=-1))       # (B, T, S)
-        fused   = (stacked * gates.unsqueeze(2)).sum(-1)              # (B, T, D)
-        return self.pool(fused)                                        # (B, D*3)
+        stacked = torch.stack(attn_outs, dim=-1)               # (B, T, D, S)
+        gates   = self.scale_gate(torch.cat(attn_outs, dim=-1)) # (B, T, S)
+        fused   = (stacked * gates.unsqueeze(2)).sum(-1)        # (B, T, D)
+        return self.pool(fused)                                  # (B, D*3)
 
     def forward(self, x):
         """
@@ -376,8 +364,9 @@ class PSXLSTMModel(nn.Module):
 
         Returns
         -------
-        logit : (B,)  raw logit — pass to BCEWithLogitsLoss during training
-                      use torch.sigmoid(logit) to get probability at inference
+        logit : (B,) raw logit
+                pass to BCEWithLogitsLoss during training
+                use torch.sigmoid(logit) for probability at inference
         """
         return self.head(self.encode(x))
 
@@ -388,9 +377,7 @@ class PSXLSTMModel(nn.Module):
         return torch.sigmoid(self.forward(x))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9.  TREE ENSEMBLE  (XGBoost + RandomForest + LR meta-learner)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 9. Tree Ensemble (XGBoost + RF + LR meta-learner) ────────────────────────
 
 class TreeEnsemble:
     """
@@ -399,14 +386,15 @@ class TreeEnsemble:
     Stage 1 — XGBoost + RandomForest trained on LSTM encode() features
                from the TRAIN set.
     Stage 2 — Logistic Regression meta-learner trained on VAL set
-               probabilities [lstm_prob, xgb_prob, rf_prob] to avoid leakage.
+               probabilities [lstm_prob, xgb_prob, rf_prob].
+               Using val set for meta-learner avoids train leakage.
 
     Usage
     -----
     ensemble = TreeEnsemble(lstm_model, cfg)
     ensemble.fit(train_loader, val_loader, device)
-    probs = ensemble.predict_proba(test_loader, device)   # (N,)
-    preds = ensemble.predict(test_loader, device)         # (N,) binary
+    probs    = ensemble.predict_proba(test_loader, device)  # (N,)
+    preds    = ensemble.predict(test_loader, device)        # (N,) binary
     """
 
     def __init__(self, lstm_model, cfg):
@@ -418,9 +406,9 @@ class TreeEnsemble:
         self.lstm = lstm_model
 
         self.xgb = XGBClassifier(
-            n_estimators     = m.get("xgb_trees", 500),
-            max_depth        = m.get("xgb_depth", 6),
-            learning_rate    = m.get("xgb_lr", 0.02),
+            n_estimators     = m.get("xgb_trees",  300),
+            max_depth        = m.get("xgb_depth",    6),
+            learning_rate    = m.get("xgb_lr",    0.02),
             subsample        = 0.8,
             colsample_bytree = 0.8,
             min_child_weight = 3,
@@ -431,21 +419,16 @@ class TreeEnsemble:
             verbosity        = 0,
         )
         self.rf = RandomForestClassifier(
-            n_estimators = m.get("rf_trees", 300),
-            max_depth    = m.get("rf_depth", 14),
+            n_estimators = m.get("rf_trees",  200),
+            max_depth    = m.get("rf_depth",   14),
             max_features = 0.6,
             n_jobs       = -1,
             random_state = 42,
         )
-        # Meta-learner: 3 inputs (lstm_prob, xgb_prob, rf_prob) -> direction
         self.meta = LogisticRegression(C=1.0, max_iter=1000)
 
     @torch.no_grad()
     def _get_features_and_probs(self, loader, device):
-        """
-        Returns encoded features, lstm probabilities, and true labels
-        for all batches in a loader.
-        """
         self.lstm.eval()
         feats, probs, targets = [], [], []
         for xb, yb in loader:
@@ -454,20 +437,16 @@ class TreeEnsemble:
             probs.append(torch.sigmoid(self.lstm(xb)).cpu().numpy())
             targets.append(yb.numpy())
         return (
-            np.concatenate(feats),     # (N, D*3)
-            np.concatenate(probs),     # (N,)
-            np.concatenate(targets),   # (N,)
+            np.concatenate(feats),
+            np.concatenate(probs),
+            np.concatenate(targets),
         )
 
     def fit(self, train_loader, val_loader, device):
-        """
-        Train XGB + RF on train encoded features.
-        Train meta-learner on val set probabilities (avoids leakage).
-        """
         log.info("TreeEnsemble.fit — extracting train features ...")
         X_train, _, y_train = self._get_features_and_probs(train_loader, device)
 
-        log.info("Fitting XGBoost on %d samples, %d features ...", *X_train.shape)
+        log.info("Fitting XGBoost on %d samples %d features ...", *X_train.shape)
         self.xgb.fit(X_train, y_train)
 
         log.info("Fitting RandomForest ...")
@@ -475,7 +454,6 @@ class TreeEnsemble:
 
         log.info("Building meta-features on val set ...")
         X_val, lstm_val_prob, y_val = self._get_features_and_probs(val_loader, device)
-
         xgb_val_prob = self.xgb.predict_proba(X_val)[:, 1]
         rf_val_prob  = self.rf.predict_proba(X_val)[:, 1]
         meta_val     = np.stack([lstm_val_prob, xgb_val_prob, rf_val_prob], axis=1)
@@ -490,7 +468,6 @@ class TreeEnsemble:
         )
 
     def predict_proba(self, loader, device):
-        """Returns blended UP probability. Shape: (N,)"""
         X_enc, lstm_prob, _ = self._get_features_and_probs(loader, device)
         xgb_prob  = self.xgb.predict_proba(X_enc)[:, 1]
         rf_prob   = self.rf.predict_proba(X_enc)[:, 1]
@@ -498,13 +475,10 @@ class TreeEnsemble:
         return self.meta.predict_proba(meta_X)[:, 1]
 
     def predict(self, loader, device, threshold=0.5):
-        """Returns binary predictions (0=DOWN, 1=UP). Shape: (N,)"""
         return (self.predict_proba(loader, device) >= threshold).astype(int)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10.  BUILD FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── 10. Build Functions ───────────────────────────────────────────────────────
 
 def build_model(cfg):
     """
@@ -520,13 +494,13 @@ def build_model(cfg):
     """
     m     = cfg.get("model", {})
     model = PSXLSTMModel(
-        input_size  = m.get("input_size",   31),
-        hidden_size = m.get("lstm_hidden",  256),
-        num_layers  = m.get("lstm_layers",   4),
-        dropout     = m.get("lstm_dropout", 0.3),
-        fc_hidden   = m.get("fc_hidden",    256),
-        num_heads   = m.get("num_heads",     8),
-        cross_heads = m.get("cross_heads",   4),
+        input_size  = m.get("input_size",    31),
+        hidden_size = m.get("lstm_hidden",  128),
+        num_layers  = m.get("lstm_layers",    2),
+        dropout     = m.get("lstm_dropout", 0.4),
+        fc_hidden   = m.get("fc_hidden",    128),
+        num_heads   = m.get("num_heads",      4),
+        cross_heads = m.get("cross_heads",    2),
     )
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Model built: PSXLSTMModel | trainable params: %s", f"{n:,}")
@@ -543,7 +517,7 @@ def build_ensemble(cfg, lstm_model, train_loader, val_loader, device):
     cfg          : dict  (loaded config.yaml)
     lstm_model   : trained PSXLSTMModel
     train_loader : DataLoader for training split
-    val_loader   : DataLoader for validation split (used for meta-learner)
+    val_loader   : DataLoader for val split (used for meta-learner)
     device       : torch.device
 
     Returns
@@ -556,3 +530,36 @@ def build_ensemble(cfg, lstm_model, train_loader, val_loader, device):
     ensemble = TreeEnsemble(lstm_model, cfg)
     ensemble.fit(train_loader, val_loader, device)
     return ensemble
+
+
+if __name__ == "__main__":
+    import yaml, os
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s  %(levelname)s  %(message)s")
+
+    cfg_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "config.yaml"
+    )
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info("Device: %s", device)
+
+    model = build_model(cfg).to(device)
+
+    # ── Forward pass smoke test
+    B, T, F = 8, cfg["model"]["seq_len"], cfg["model"]["input_size"]
+    dummy   = torch.randn(B, T, F).to(device)
+    logits  = model(dummy)
+    encoded = model.encode(dummy)
+    probs   = model.predict_proba(dummy)
+
+    print(f"\nSmoke test passed:")
+    print(f"  Input   : {dummy.shape}")
+    print(f"  Logits  : {logits.shape}    (expected: ({B},))")
+    print(f"  Encoded : {encoded.shape}  (expected: ({B}, {cfg['model']['lstm_hidden']*3}))")
+    print(f"  Probs   : {probs.shape}     (expected: ({B},))")
+    print(f"  Prob range: [{probs.min():.4f}, {probs.max():.4f}]  (expected: 0-1)")
+    print(f"  Params  : {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
