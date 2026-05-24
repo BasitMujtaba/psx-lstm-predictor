@@ -1,150 +1,127 @@
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # psx-lstm-predictor  |  config.yaml
 # Central configuration for all pipeline steps
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 data:
   start_date: "2010-01-01"
   end_date:   "2026-01-31"
-  train_end:  "2024-01-01"
-  test_start: "2024-01-01"
-  test_end:   "2026-01-31"
   raw_prices_dir:  "data/raw/psx_prices"
   raw_news_dir:    "data/raw/news"
   processed_dir:   "data/processed"
+  scalers_dir:     "data/scalers"
   predictions_dir: "data/predictions"
   tickers:
-    - "PSO.KA"
-    - "OGDC.KA"
-    - "PPL.KA"
-    - "MARI.KA"
-    - "POL.KA"
-    - "HBL.KA"
-    - "MCB.KA"
-    - "UBL.KA"
-    - "NBP.KA"
-    - "BAFL.KA"
-    - "ENGRO.KA"
-    - "EFERT.KA"
-    - "FATIMA.KA"
-    - "FFC.KA"
-    - "LUCK.KA"
-    - "DGKC.KA"
-    - "MLCF.KA"
-    - "PIOC.KA"
-    - "NML.KA"
-    - "NCL.KA"
-    - "GATM.KA"
-    - "TRG.KA"
-    - "SYS.KA"
-    - "AVN.KA"
-    - "SEARL.KA"
-    - "FEROZ.KA"
-    - "INDU.KA"
-    - "PSMC.KA"
-    - "HUBC.KA"
-    - "KAPCO.KA"
+    - "PSO"
+    - "OGDC"
+    - "PPL"
+    - "MARI"
+    - "POL"
+    - "HBL"
+    - "MCB"
+    - "UBL"
+    - "NBP"
+    - "BAFL"
+    - "ENGRO"
+    - "EFERT"
+    - "FATIMA"
+    - "FFC"
+    - "LUCK"
+    - "DGKC"
+    - "MLCF"
+    - "PIOC"
+    - "NML"
+    - "NCL"
+    - "GATM"
+    - "TRG"
+    - "SYS"
+    - "AVN"
+    - "SEARL"
+    - "FEROZ"
+    - "INDU"
+    - "PSMC"
+    - "HUBC"
+    - "KAPCO"
 
 features:
+  input_file_decay: "data/processed/features_decay.csv"
+  input_file_flags: "data/processed/features_flags.csv"
+  use_flags:        false          # true = use features_flags, false = features_decay
+  noise_threshold:  0.005          # ±0.5% filter applied in features.py
   cols:
-    # ── MACD family ───────────────────────────────────────
-    - "macd_pct"
-    - "macd_sig_pct"
-    - "macd_hist_pct"
-    # ── Momentum oscillators ──────────────────────────────
-    - "rsi_norm"
-    - "cci_norm"
-    - "williams_r_norm"
-    - "stoch_k_norm"
-    - "stoch_d_norm"
-    - "roc_5_norm"
-    - "roc_10_norm"
-    # ── Directional movement ──────────────────────────────
-    - "di_plus_norm"
-    - "di_minus_norm"
-    - "adx_norm"
-    - "di_diff_norm"
-    # ── Volatility ────────────────────────────────────────
-    - "atr_pct"
-    - "bb_pct_b"
-    - "bb_width"
-    - "rolling_vol_10"
-    - "rolling_vol_20"
-    - "parkinson_vol"
-    # ── Volume ────────────────────────────────────────────
-    - "obv_pct"
-    - "volume_ma5_ratio"
-    - "volume_ma20_ratio"
-    # ── Price structure ───────────────────────────────────
-    - "turbulence"
-    - "close_to_high"
-    - "close_to_low"
-    - "high_low_range_pct"
-    - "gap_pct"
-    # ── Lagged returns ────────────────────────────────────
+    # ── Momentum ──────────────────────────────────────────
     - "ret_1d"
     - "ret_5d"
     - "ret_10d"
     - "ret_20d"
-    - "ret_60d"
-    # ── Cross-sectional ───────────────────────────────────
+    # ── Indicators ────────────────────────────────────────
+    - "rsi"
+    - "macd"
+    - "bb_pct"
+    - "bb_width"
+    - "turbulence"
+    # ── Trend ratios (scale-free) ─────────────────────────
+    - "close_to_ema9"
+    - "close_to_ema21"
+    - "close_to_ema50"
+    # ── Price structure ───────────────────────────────────
+    - "close_to_high"
+    - "close_to_low"
+    - "gap_pct"
+    - "high_low_range_pct"
+    # ── Volume ────────────────────────────────────────────
+    - "volume_ma5_ratio"
+    - "volume_ma20_ratio"
     - "vol_ratio_5_20"
-    - "market_return"
-    - "relative_strength"
-    - "sector_return"
+    - "rolling_vol_10"
+    - "rolling_vol_20"
+    - "volume_trend"
+    # ── Range ─────────────────────────────────────────────
+    - "52w_high_ratio"
+    - "52w_low_ratio"
+    # ── Circuit breakers ──────────────────────────────────
+    - "near_upper_circuit"
+    - "near_lower_circuit"
+    # ── Calendar ──────────────────────────────────────────
+    - "day_of_week"
+    - "month"
     # ── Sentiment ─────────────────────────────────────────
-    - "sentiment_score"
-    - "macro_pakistan_score"
-    - "psx_market_score"
-    - "energy_oil_score"
-    - "banking_finance_score"
-    - "geopolitical_global_score"
-    - "political_stability_score"
-    - "pakistani_media_score"
-    - "international_media_pakistan_score"
-    - "sentiment_ma5"
-  target:       "ret_1d_future"
-  target_price: "close"
-  n_features:   47
+    - "sentiment_macro"
+    - "sentiment_energy"
+    - "news_count"
+  target:      "target"
+  n_features:  31
 
 model:
-  architecture:    "lstm"
-  type:            "lstm"
-  seq_len:         60
-  input_size:      47
+  input_size:      31
+  seq_len:         30
   lstm_hidden:     128
   lstm_layers:     2
-  lstm_dropout:    0.3
-  num_heads:       8
-  cross_heads:     4
+  lstm_dropout:    0.4
+  num_heads:       4
+  cross_heads:     2
   fc_hidden:       128
   use_ensemble:    true
-  xgb_trees:       1000
+  xgb_trees:       300
   xgb_depth:       6
   xgb_lr:          0.02
-  rf_trees:        500
+  rf_trees:        200
   rf_depth:        14
-  tf_d_model:      64
-  tf_nhead:        4
-  tf_layers:       2
-  tf_dropout:      0.1
   checkpoints_dir: "src/models/checkpoints"
 
 training:
-  max_epochs:      80
-  epochs:          80
-  batch_size:      32
-  lr:              0.001
-  patience:        15
-  seq_len:         60
-  grad_clip:       0.5
-  weight_decay:    0.0001
-  lr_factor:       0.4
-  lr_patience:     5
-  num_workers:     2
-  checkpoint_dir:  "src/models/checkpoints"
-  loss:            "gaussian_nll"
-  warmup_epochs:   5
+  max_epochs:    50
+  batch_size:    256
+  lr:            0.001
+  patience:      10
+  grad_clip:     1.0
+  weight_decay:  0.0001
+  lr_factor:     0.5
+  lr_patience:   5
+  num_workers:   2
+  warmup_epochs: 3
+  train_ratio:   0.70
+  val_ratio:     0.15
 
 news:
   finbert_model: "ProsusAI/finbert"
