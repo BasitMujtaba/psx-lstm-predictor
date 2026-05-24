@@ -3,14 +3,14 @@
  File   : src/data_collection/psx_scraper.py
  Project: PSX LSTM Predictor
  Purpose: Fetches OHLCV price data for PSX tickers via dps.psx.com.pk,
-          derives LDCP / Change / Change(%) from close prices.
+          parses LDCP / Change directly from the site table (no re-derivation).
 
  Saves:
    data/raw/psx_prices/psx_prices_raw.csv  <- OHLCV + LDCP + Change + Change(%)
 
  Cache logic:
    1. Raw CSV exists and is valid -> return it directly (skip downloading)
-   2. Raw CSV missing             -> fetch from PSX, derive LDCP/change, save raw
+   2. Raw CSV missing             -> fetch from PSX, parse LDCP/change, save raw
 ================================================================================
 """
 
@@ -44,7 +44,7 @@ _HEADERS = {
     "Origin":          "https://dps.psx.com.pk",
 }
 
-_NUMERIC_COLS  = ["open", "high", "low", "close", "volume"]
+_NUMERIC_COLS  = ["open", "high", "low", "close", "volume", "ldcp", "change"]
 _CONCURRENCY   = 4
 _TICKER_PAUSE  = 1.5
 _429_WAIT      = 8.0
@@ -124,10 +124,16 @@ def _parse_table(html: str, symbol: str) -> pd.DataFrame:
     table = soup.find("table", id="historicalTable")
     if not table or not table.find("tbody"):
         return pd.DataFrame()
+
+    # ── Detect column layout from thead so index shifts don't silently break
+    thead = table.find("thead")
+    headers = [th.get_text(strip=True).lower() for th in thead.find_all("th")] if thead else []
+    log.debug("[%s] table headers: %s", symbol, headers)
+
     rows = []
     for tr in table.find("tbody").find_all("tr"):
         tds = tr.find_all("td")
-        if len(tds) < 6:
+        if len(tds) < 8:
             continue
         rows.append({
             "date":   tds[0].get_text(strip=True),
@@ -136,13 +142,20 @@ def _parse_table(html: str, symbol: str) -> pd.DataFrame:
             "low":    tds[3].get_text(strip=True).replace(",", ""),
             "close":  tds[4].get_text(strip=True).replace(",", ""),
             "volume": tds[5].get_text(strip=True).replace(",", ""),
+            "ldcp":   tds[6].get_text(strip=True).replace(",", ""),
+            "change": tds[7].get_text(strip=True).replace(",", ""),
         })
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     for col in _NUMERIC_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # ── Derive change_pct from site-provided ldcp + change (no shift needed)
+    df["change_pct"] = ((df["change"] / df["ldcp"]) * 100).round(2)
+
     df.dropna(subset=["date", "close"], inplace=True)
     df["ticker"] = symbol
     df.sort_values("date", inplace=True)
@@ -150,11 +163,7 @@ def _parse_table(html: str, symbol: str) -> pd.DataFrame:
     return df
 
 
-def _derive_ldcp_change(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ldcp"]       = df.groupby("ticker")["close"].shift(1)
-    df["change"]     = (df["close"] - df["ldcp"]).round(2)
-    df["change_pct"] = ((df["change"] / df["ldcp"]) * 100).round(2)
+def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     col_order = ["date", "ticker", "ldcp", "open", "high", "low", "close",
                  "change", "change_pct", "volume"]
     return df[col_order]
@@ -242,7 +251,7 @@ def fetch_psx_prices(tickers, start, end, concurrency=_CONCURRENCY):
     result = pd.concat(valid, ignore_index=True)
     result.sort_values(["date", "ticker"], inplace=True)
     result.reset_index(drop=True, inplace=True)
-    result = _derive_ldcp_change(result)
+    result = _reorder_columns(result)
     log.info("Raw shape: %s | tickers: %d | failed: %d",
              result.shape, result["ticker"].nunique(), len(failed))
     return result, failed
