@@ -3,7 +3,7 @@ src/feature_engineering/features.py
 =====================================
 Builds the final feature matrix for the LSTM model.
 
-Feature set (33 features)
+Feature set (31 features)
 --------------------------
   Momentum        : ret_1d, ret_5d, ret_10d, ret_20d
   Indicators      : rsi, macd, bb_pct, bb_width, turbulence
@@ -14,8 +14,7 @@ Feature set (33 features)
   Range           : 52w_high_ratio, 52w_low_ratio
   Circuit         : near_upper_circuit, near_lower_circuit
   Calendar        : day_of_week, month
-  Sentiment       : sentiment_macro, sentiment_energy, news_count,
-                    sentiment_ticker, has_ticker_news
+  Sentiment       : sentiment_macro, sentiment_energy, news_count
 
 Target
 ------
@@ -58,21 +57,17 @@ FEATURE_COLS = [
     "near_upper_circuit", "near_lower_circuit",
     "day_of_week", "month",
     "sentiment_macro", "sentiment_energy", "news_count",
-    "sentiment_ticker", "has_ticker_news",
 ]
 
 TARGET_COL = "target"
 
-
-# ── GitHub push ───────────────────────────────────────────────────────────────
 
 def _push_to_github(decay_path, flags_path):
     try:
         cmds = [
             ["git", "-C", PROJECT_ROOT, "pull", "--rebase", "origin", "main"],
             ["git", "-C", PROJECT_ROOT, "add", decay_path, flags_path],
-            ["git", "-C", PROJECT_ROOT, "commit", "-m",
-             "Update features: 33 features, add has_ticker_news flag"],
+            ["git", "-C", PROJECT_ROOT, "commit", "-m", "Revert features to 31 cols, 5-day target"],
             ["git", "-C", PROJECT_ROOT, "push"],
         ]
         for cmd in cmds:
@@ -82,79 +77,56 @@ def _push_to_github(decay_path, flags_path):
         log.warning("GitHub push failed: %s", e.stderr.decode())
 
 
-# ── Per-ticker feature builder ────────────────────────────────────────────────
-
 def _build_ticker_features(df):
     df = df.copy().sort_values("date").reset_index(drop=True)
 
-    # ── Momentum
     df["ret_1d"]  = np.log(df["close"] / df["ldcp"]).clip(-0.15, 0.15)
     df["ret_5d"]  = np.log(df["close"] / df["close"].shift(5)).clip(-0.40, 0.40)
     df["ret_10d"] = np.log(df["close"] / df["close"].shift(10)).clip(-0.50, 0.50)
     df["ret_20d"] = np.log(df["close"] / df["close"].shift(20)).clip(-0.60, 0.60)
 
-    # ── Volatility
     df["rolling_vol_10"] = df["ret_1d"].rolling(10).std()
     df["rolling_vol_20"] = df["ret_1d"].rolling(20).std()
     vol_5                = df["ret_1d"].rolling(5).std()
     vol_20               = df["ret_1d"].rolling(20).std()
     df["vol_ratio_5_20"] = (vol_5 / vol_20.replace(0, np.nan)).clip(0, 5)
 
-    # ── Indicators
     df["macd"]       = (df["macd"] / df["close"].replace(0, np.nan)).clip(-0.5, 0.5)
     df["bb_pct"]     = df["bb_pct"].clip(-0.5, 1.5)
     df["bb_width"]   = df["bb_width"].clip(0, 1.0)
     df["turbulence"] = df["turbulence"].clip(0, 20)
 
-    # ── Trend ratios
     df["close_to_ema9"]  = ((df["close"] / df["ema_9"].replace(0,  np.nan)) - 1).clip(-0.5, 0.5)
     df["close_to_ema21"] = ((df["close"] / df["ema_21"].replace(0, np.nan)) - 1).clip(-0.5, 0.5)
     df["close_to_ema50"] = ((df["close"] / df["ema_50"].replace(0, np.nan)) - 1).clip(-0.5, 0.5)
 
-    # ── Price structure
     day_range                = (df["high"] - df["low"]).replace(0, np.nan)
     df["close_to_high"]      = ((df["high"] - df["close"]) / day_range).clip(0, 1)
     df["close_to_low"]       = ((df["close"] - df["low"])  / day_range).clip(0, 1)
     df["high_low_range_pct"] = (day_range / df["close"]).clip(0, 0.2)
     df["gap_pct"]            = (df["open"] / df["ldcp"] - 1).clip(-0.5, 0.5)
 
-    # ── Volume
     vol_ma5                 = df["volume"].rolling(5).mean().replace(0,  np.nan)
     vol_ma20                = df["volume"].rolling(20).mean().replace(0, np.nan)
     df["volume_ma5_ratio"]  = (df["volume"] / vol_ma5).clip(0, 10)
     df["volume_ma20_ratio"] = (df["volume"] / vol_ma20).clip(0, 10)
     df["volume_trend"]      = np.log(vol_ma5 / vol_ma20.replace(0, np.nan)).clip(-2, 2)
 
-    # ── 52-week range
     df["52w_high_ratio"] = ((df["close"] / df["close"].rolling(126).max()) - 1).clip(-1, 0)
     df["52w_low_ratio"]  = ((df["close"] / df["close"].rolling(126).min()) - 1).clip(0, 3)
 
-    # ── Circuit breakers
     df["near_upper_circuit"] = (df["close"] / df["ldcp"] > 1.045).astype(int)
     df["near_lower_circuit"] = (df["close"] / df["ldcp"] < 0.955).astype(int)
 
-    # ── Calendar
     df["day_of_week"] = pd.to_datetime(df["date"]).dt.dayofweek
     df["month"]       = pd.to_datetime(df["date"]).dt.month
 
-    # ── Ticker sentiment + presence flag
-    if "sentiment_ticker" in df.columns:
-        raw = df["sentiment_ticker"]
-        df["has_ticker_news"]  = raw.notna().astype(float)
-        df["sentiment_ticker"] = raw.clip(-1.0, 1.0).fillna(0.0)
-    else:
-        df["sentiment_ticker"] = 0.0
-        df["has_ticker_news"]  = 0.0
-
-    # ── Target: 5-day forward direction with +-1% noise filter
     df["next_ret"] = np.log(df["close"].shift(-5) / df["close"])
     df = df[(df["next_ret"] > THRESHOLD) | (df["next_ret"] < -THRESHOLD)].copy()
     df[TARGET_COL] = (df["next_ret"] > THRESHOLD).astype(int)
 
     return df
 
-
-# ── Master builder ────────────────────────────────────────────────────────────
 
 def _build(input_path, output_path, label):
     log.info("Loading %s ...", input_path)
@@ -183,10 +155,6 @@ def _build(input_path, output_path, label):
              label, len(df), df["ticker"].nunique(), len(FEATURE_COLS))
     log.info("%s: Target UP %.1f%% | DOWN %.1f%%",
              label, df[TARGET_COL].mean()*100, (1-df[TARGET_COL].mean())*100)
-    log.info("%s: sentiment_ticker zeros=%.1f%%  has_ticker_news mean=%.3f",
-             label,
-             (df["sentiment_ticker"] == 0).mean() * 100,
-             df["has_ticker_news"].mean())
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df.to_csv(output_path, index=False)
@@ -195,8 +163,6 @@ def _build(input_path, output_path, label):
 
     return df
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
     processed_dir = os.path.join(BASE, "processed")

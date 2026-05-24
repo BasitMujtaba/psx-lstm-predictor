@@ -47,7 +47,7 @@ features:
   input_file_decay: "data/processed/features_decay.csv"
   input_file_flags: "data/processed/features_flags.csv"
   use_flags:        false
-  noise_threshold:  0.005
+  noise_threshold:  0.01
   cols:
     - "ret_1d"
     - "ret_5d"
@@ -88,7 +88,7 @@ model:
   seq_len:         30
   lstm_hidden:     64
   lstm_layers:     1
-  lstm_dropout:    0.3
+  lstm_dropout:    0.6
   num_heads:       2
   cross_heads:     1
   fc_hidden:       64
@@ -103,16 +103,17 @@ model:
 training:
   max_epochs:    50
   batch_size:    256
-  lr:            0.001
+  lr:            0.0003
   patience:      10
   grad_clip:     1.0
-  weight_decay:  0.0001
+  weight_decay:  0.005
   lr_factor:     0.5
   lr_patience:   5
   num_workers:   2
   warmup_epochs: 3
   train_ratio:   0.70
   val_ratio:     0.15
+  label_smooth:  0.1
 
 news:
   finbert_model: "ProsusAI/finbert"
