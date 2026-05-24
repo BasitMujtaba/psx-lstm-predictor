@@ -7,7 +7,7 @@ checkpointing, and automatic resume if session breaks.
 What this module does
 ---------------------
   1. Trains PSXLSTMModel (binary classification UP=1/DOWN=0)
-  2. BCEWithLogitsLoss with optional pos_weight for class imbalance
+  2. BCEWithLogitsLoss with label smoothing + pos_weight
   3. Evaluates loss, accuracy, AUC, F1 on val set every epoch
   4. Saves best checkpoint (highest val AUC) to disk
   5. Saves resume checkpoint after EVERY epoch
@@ -15,7 +15,6 @@ What this module does
   7. Stops early if val AUC does not improve for patience epochs
   8. AdamW + CosineAnnealingLR + linear warmup
   9. Gradient clipping
-  10. Optional TreeEnsemble stacking after LSTM training
 
 Saved artefacts
 ---------------
@@ -25,24 +24,18 @@ Saved artefacts
 config.yaml sections used
 -------------------------
   model:
-    input_size:      31
-    lstm_hidden:     64
-    lstm_layers:     1
-    lstm_dropout:    0.3
-    fc_hidden:       64
-    num_heads:       2
-    cross_heads:     1
-    use_ensemble:    false
+    lstm_dropout:    0.6
     checkpoints_dir: src/models/checkpoints
 
   training:
     max_epochs:    50
     patience:      10
-    lr:            0.001
-    weight_decay:  0.0001
+    lr:            0.0003
+    weight_decay:  0.005
     grad_clip:     1.0
     warmup_epochs: 3
     batch_size:    256
+    label_smooth:  0.1
 """
 
 import os
@@ -148,17 +141,22 @@ def _warmup_lr(optimiser, epoch, warmup_epochs, base_lr):
 
 # -- 4. One Epoch Train --------------------------------------------------------
 
-def _train_epoch(model, loader, criterion, optimiser, device, grad_clip):
+def _train_epoch(model, loader, criterion, optimiser,
+                 device, grad_clip, label_smooth=0.1):
     model.train()
     total_loss = 0.0
     all_probs, all_targets = [], []
 
     for xb, yb in loader:
-        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+
+        # label smoothing: 0 -> 0.05, 1 -> 0.95
+        yb_smooth = yb * (1 - label_smooth) + 0.5 * label_smooth
 
         optimiser.zero_grad()
         logits = model(xb)
-        loss   = criterion(logits, yb)
+        loss   = criterion(logits, yb_smooth)
         loss.backward()
 
         if grad_clip is not None:
@@ -168,7 +166,7 @@ def _train_epoch(model, loader, criterion, optimiser, device, grad_clip):
 
         total_loss += loss.item() * len(yb)
         all_probs.append(torch.sigmoid(logits).detach().cpu().numpy())
-        all_targets.append(yb.cpu().numpy())
+        all_targets.append(yb.cpu().numpy())   # original labels for metrics
 
     probs           = np.concatenate(all_probs)
     targets         = np.concatenate(all_targets)
@@ -188,7 +186,7 @@ def _eval_epoch(model, loader, criterion, device):
     for xb, yb in loader:
         xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
         logits  = model(xb)
-        loss    = criterion(logits, yb)
+        loss    = criterion(logits, yb)   # no smoothing on val/test
 
         total_loss += loss.item() * len(yb)
         all_probs.append(torch.sigmoid(logits).cpu().numpy())
@@ -206,12 +204,13 @@ def _eval_epoch(model, loader, criterion, device):
 def train(model, train_loader, val_loader,
           cfg, ckpt_dir, feature_cols, target_col):
     t_cfg         = cfg.get("training", {})
-    epochs        = t_cfg.get("max_epochs", t_cfg.get("epochs", 50))
+    epochs        = t_cfg.get("max_epochs",    50)
     patience      = t_cfg.get("patience",      10)
-    base_lr       = t_cfg.get("lr",           1e-3)
-    weight_decay  = t_cfg.get("weight_decay", 1e-4)
-    grad_clip     = t_cfg.get("grad_clip",    1.0)
-    warmup_epochs = t_cfg.get("warmup_epochs",  3)
+    base_lr       = t_cfg.get("lr",        0.0003)
+    weight_decay  = t_cfg.get("weight_decay", 0.005)
+    grad_clip     = t_cfg.get("grad_clip",     1.0)
+    warmup_epochs = t_cfg.get("warmup_epochs",   3)
+    label_smooth  = t_cfg.get("label_smooth",  0.1)
 
     best_ckpt   = os.path.join(ckpt_dir, "best_model.pt")
     resume_ckpt = os.path.join(ckpt_dir, "resume_model.pt")
@@ -268,7 +267,7 @@ def train(model, train_loader, val_loader,
             _warmup_lr(optimiser, epoch, warmup_epochs, base_lr)
 
         train_m     = _train_epoch(model, train_loader, criterion,
-                                   optimiser, device, grad_clip)
+                                   optimiser, device, grad_clip, label_smooth)
         val_m, _, _ = _eval_epoch(model, val_loader, criterion, device)
         current_lr  = optimiser.param_groups[0]["lr"]
 
