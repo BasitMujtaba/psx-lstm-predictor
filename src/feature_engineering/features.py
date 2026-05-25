@@ -14,7 +14,7 @@ Feature set (31 features)
   Range           : 52w_high_ratio, 52w_low_ratio
   Circuit         : near_upper_circuit, near_lower_circuit
   Calendar        : day_of_week, month
-  Sentiment       : sentiment_macro, sentiment_energy, news_count
+  Sentiment       : sentiment_relevant, sentiment_ticker, news_count
 
 Target
 ------
@@ -46,6 +46,8 @@ BASE         = os.path.join(PROJECT_ROOT, "data")
 
 THRESHOLD = 0.01
 
+# EDIT: replaced sentiment_macro + sentiment_energy with sentiment_relevant + sentiment_ticker
+# Total stays 31 features
 FEATURE_COLS = [
     "ret_1d", "ret_5d", "ret_10d", "ret_20d",
     "rsi", "macd", "bb_pct", "bb_width", "turbulence",
@@ -56,7 +58,7 @@ FEATURE_COLS = [
     "52w_high_ratio", "52w_low_ratio",
     "near_upper_circuit", "near_lower_circuit",
     "day_of_week", "month",
-    "sentiment_macro", "sentiment_energy", "news_count",
+    "sentiment_relevant", "sentiment_ticker", "news_count",
 ]
 
 TARGET_COL = "target"
@@ -67,7 +69,8 @@ def _push_to_github(decay_path, flags_path):
         cmds = [
             ["git", "-C", PROJECT_ROOT, "pull", "--rebase", "origin", "main"],
             ["git", "-C", PROJECT_ROOT, "add", decay_path, flags_path],
-            ["git", "-C", PROJECT_ROOT, "commit", "-m", "Revert features to 31 cols, 5-day target"],
+            ["git", "-C", PROJECT_ROOT, "commit", "-m",
+             "features: swap to sentiment_relevant + sentiment_ticker, 31 cols"],
             ["git", "-C", PROJECT_ROOT, "push"],
         ]
         for cmd in cmds:
