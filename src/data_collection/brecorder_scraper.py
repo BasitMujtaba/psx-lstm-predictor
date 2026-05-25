@@ -1,12 +1,48 @@
-import asyncio
-from playwright.async_api import async_playwright
+"""
+================================================================================
+ File   : src/data_collection/brecorder_scraper.py
+ Project: PSX LSTM Predictor
+ Purpose: Scrapes financial news headlines from Brecorder for Pakistan market.
+          Filters, deduplicates, and saves raw CSV only.
+
+ Saves:
+   data/raw/news/brecorder_pakistan_raw.csv
+   data/processed/news/brecorder_pakistan_processed.csv
+
+ Cache logic:
+   1. If raw CSV exists -> skip scraping entirely, go straight to processing
+   2. If raw CSV does not exist -> scrape from scratch
+================================================================================
+"""
+
+import asyncio, csv, os, random, re, logging
+import pandas as pd
+import yaml
 from datetime import date, timedelta
-import re, csv, os, random
+from playwright.async_api import async_playwright
 from tqdm import tqdm
 
-RAW_CSV        = "data/raw/news/brecorder_pakistan_raw.csv"
-PROGRESS_FILE  = "data/brecorder_progress.txt"
-FINAL_CSV      = "data/processed/brecorder_news_processed.csv"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def load_config(path=None):
+    if path is None:
+        path = os.path.join(PROJECT_ROOT, "config.yaml")
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+def _resolve(cfg_path):
+    if os.path.isabs(cfg_path):
+        return cfg_path
+    return os.path.join(PROJECT_ROOT, cfg_path)
+
+
+# ── Filters ───────────────────────────────────────────────────────────────────
 
 FOREIGN_SIGNALS = (
     r"\b(european[ ]stock|europe[ ]stock|asian[ ]markets|asian[ ]stocks"
@@ -155,6 +191,9 @@ USER_AGENTS    = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 def should_keep(title: str) -> bool:
     if not title or len(title) < 15:
         return False
@@ -176,31 +215,43 @@ def get_categories(title: str) -> str:
     return "|".join(cats) if cats else "general_market"
 
 
-def load_done() -> set:
-    done = set()
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            for line in f:
-                s = line.strip()
-                if s:
-                    done.add(s)
-    return done
+# ── Processing ────────────────────────────────────────────────────────────────
+
+def process_raw(raw_path: str, processed_path: str) -> pd.DataFrame:
+    """
+    Reads raw CSV, applies should_keep filter, deduplicates,
+    refreshes category column, sorts by date, saves to processed_path.
+    Returns the processed DataFrame.
+    """
+    log.info("Processing raw file: %s", raw_path)
+    df = pd.read_csv(raw_path)
+    raw_count = len(df)
+
+    # Re-apply filter (raw file may contain unfiltered rows from resume writes)
+    mask = df["title"].apply(should_keep)
+    df   = df[mask].copy()
+    log.info("Filter: %d -> %d rows", raw_count, len(df))
+
+    # Refresh category column
+    df["category"] = df["title"].apply(get_categories)
+
+    # Deduplicate on (date, title)
+    before = len(df)
+    df = df.drop_duplicates(subset=["date", "title"]).reset_index(drop=True)
+    log.info("Dedup: %d -> %d rows (removed %d)", before, len(df), before - len(df))
+
+    # Sort
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+
+    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+    df.to_csv(processed_path, index=False)
+    log.info("Saved processed file -> %s  (%d rows)", processed_path, len(df))
+    return df
 
 
-def already_complete() -> bool:
-    if not os.path.exists(FINAL_CSV):
-        return False
-    if not os.path.exists(RAW_CSV):
-        return False
-    done = load_done()
-    start = date(2010, 1, 1)
-    end   = date(2026, 12, 31)
-    total = (end - start).days + 1
-    if len(done) >= total:
-        print("Already complete — {} exists and all {:,} dates scraped. Skipping.".format(FINAL_CSV, len(done)))
-        return True
-    return False
-
+# ── Scraper internals ─────────────────────────────────────────────────────────
 
 async def new_page(browser):
     ctx = await browser.new_context(
@@ -218,7 +269,7 @@ async def new_page(browser):
 
 async def scrape_date(page, date_str: str, seen_urls: set, seen_lock) -> list:
     rows = []
-    url  = "https://www.brecorder.com/latest-news/{}".format(date_str)
+    url  = f"https://www.brecorder.com/latest-news/{date_str}"
     for attempt in range(3):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
@@ -230,27 +281,27 @@ async def scrape_date(page, date_str: str, seen_urls: set, seen_lock) -> list:
                 return rows
             try:
                 await page.wait_for_function(
-                    "() => document.querySelectorAll(\'a[href]\').length > 20",
+                    "() => document.querySelectorAll('a[href]').length > 20",
                     timeout=15_000,
                 )
             except Exception:
                 pass
             items = await page.evaluate("""
-                () => Array.from(document.querySelectorAll(\'a[href]\')).map(a => ({
-                    href: a.href || \'\',
-                    text: (a.innerText || a.textContent || \'\').trim()
+                () => Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                    href: a.href || '',
+                    text: (a.innerText || a.textContent || '').trim()
                 }))
             """)
             for item in items:
                 href  = item.get("href", "")
                 title = item.get("text", "").strip()
-                if not ARTICLE_URL_RE.search(href):  continue
-                if not title or len(title) < 10:     continue
+                if not ARTICLE_URL_RE.search(href): continue
+                if not title or len(title) < 10:    continue
                 full_url = href.split("?")[0].rstrip("/")
                 async with seen_lock:
-                    if full_url in seen_urls:         continue
+                    if full_url in seen_urls:        continue
                     seen_urls.add(full_url)
-                if not should_keep(title):            continue
+                if not should_keep(title):           continue
                 rows.append({
                     "date":     date_str,
                     "category": get_categories(title),
@@ -267,7 +318,7 @@ async def scrape_date(page, date_str: str, seen_urls: set, seen_lock) -> list:
 
 
 async def worker(wid, queue, browser, seen_urls, seen_lock,
-                 results, csv_f, writer, progress_f, pbar):
+                 results, csv_f, writer, pbar):
     ctx, page = await new_page(browser)
     while True:
         date_str = await queue.get()
@@ -290,58 +341,30 @@ async def worker(wid, queue, browser, seen_urls, seen_lock,
             results.append(row)
             writer.writerow(row)
         csv_f.flush()
-        progress_f.write(date_str + "\n")
-        progress_f.flush()
         pbar.update(1)
-        pbar.set_postfix_str("{:,} articles".format(len(results)))
+        pbar.set_postfix_str(f"{len(results):,} articles")
         queue.task_done()
 
 
-async def scrape():
-    results   = []
-    seen_urls = set()
+async def _scrape(pending, raw_path, results, seen_urls):
     seen_lock = asyncio.Lock()
-
-    start     = date(2010, 1, 1)
-    end       = date(2026, 12, 31)
-    all_dates = [(start + timedelta(n)).strftime("%Y-%m-%d")
-                 for n in range((end - start).days + 1)]
-
-    done_tasks = load_done()
-    if os.path.exists(RAW_CSV):
-        with open(RAW_CSV, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                seen_urls.add(row["url"].strip().rstrip("/"))
-                results.append(row)
-        print("Resuming — {:,} articles, {:,} dates done".format(len(results), len(done_tasks)))
-
-    pending = [d for d in all_dates if d not in done_tasks]
-    print("Dates remaining: {:,} / {:,}".format(len(pending), len(all_dates)))
-    if not pending:
-        print("Scraping already complete.")
-        return
-
-    os.makedirs(os.path.dirname(RAW_CSV),       exist_ok=True)
-    os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
-
-    csv_f  = open(RAW_CSV, "a", newline="", encoding="utf-8")
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    csv_f  = open(raw_path, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(csv_f, fieldnames=FIELDNAMES)
-    if os.path.getsize(RAW_CSV) == 0:
+    if os.path.getsize(raw_path) == 0:
         writer.writeheader()
-    progress_f = open(PROGRESS_FILE, "a", encoding="utf-8")
 
     pw       = await async_playwright().start()
     browsers = [await pw.firefox.launch(headless=True) for _ in range(TOTAL_WORKERS)]
-    print("Launched {} browsers OK".format(len(browsers)))
+    log.info("Launched %d browsers", len(browsers))
 
     try:
         queue = asyncio.Queue(maxsize=TOTAL_WORKERS * 4)
-        pbar  = tqdm(total=len(pending), desc="Scraping Brecorder", unit="date")
-        pbar.set_postfix_str("{:,} articles".format(len(results)))
+        pbar  = tqdm(total=len(pending), desc="Brecorder", unit="date")
         tasks = [
             asyncio.create_task(
                 worker(i, queue, browsers[i], seen_urls, seen_lock,
-                       results, csv_f, writer, progress_f, pbar)
+                       results, csv_f, writer, pbar)
             )
             for i in range(TOTAL_WORKERS)
         ]
@@ -354,69 +377,52 @@ async def scrape():
         pbar.close()
     finally:
         csv_f.close()
-        progress_f.close()
         for b in browsers:
             try: await b.close()
             except Exception: pass
         await pw.stop()
-    print("\nScraping done! {:,} articles -> {}".format(len(results), RAW_CSV))
+    log.info("Scraping done — %d articles -> %s", len(results), raw_path)
 
 
-def process():
-    print("\n-- Processing {} --".format(RAW_CSV))
-    with open(RAW_CSV, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    print("Loaded:            {:,} rows".format(len(rows)))
+# ── Public API ────────────────────────────────────────────────────────────────
 
-    url_map = {}
-    for row in rows:
-        key = row["url"].strip().rstrip("/").lower()
-        if key not in url_map:
-            url_map[key] = row
-    merged = list(url_map.values())
-    print("After URL dedup:   {:,} rows  (removed {:,})".format(len(merged), len(rows) - len(merged)))
+def run(cfg=None):
+    if cfg is None:
+        cfg = load_config()
 
-    seen_titles = set()
-    deduped     = []
-    for row in merged:
-        key = row["title"].strip().lower()
-        if key not in seen_titles:
-            seen_titles.add(key)
-            deduped.append(row)
-    print("After title dedup: {:,} rows  (removed {:,})".format(len(deduped), len(merged) - len(deduped)))
+    start    = str(cfg["data"]["start_date"])
+    end      = str(cfg["data"]["end_date"])
+    news_dir = _resolve(cfg["data"]["raw_news_dir"])
+    raw_path = os.path.join(news_dir, "brecorder_pakistan_raw.csv")
 
-    clean, excluded = [], []
-    for row in deduped:
-        if should_keep(row["title"]):
-            row["category"] = get_categories(row["title"])
-            clean.append(row)
-        else:
-            excluded.append(row["title"])
-    print("After filter:      {:,} rows  (removed {:,})".format(len(clean), len(deduped) - len(clean)))
+    # Derive processed path: swap raw_news_dir -> processed/news
+    processed_dir  = os.path.join(PROJECT_ROOT, "data", "processed", "news")
+    processed_path = os.path.join(processed_dir, "brecorder_pakistan_processed.csv")
 
-    if excluded:
-        print("\nSample removed:")
-        for t in excluded[:10]:
-            print("  x  " + t)
+    os.makedirs(news_dir, exist_ok=True)
 
-    print("\nSample kept:")
-    for r in clean[:10]:
-        print("  ok  [{}]  {}".format(r["category"], r["title"]))
+    # ── If raw file already exists, skip scraping entirely ────────────────────
+    if os.path.exists(raw_path):
+        log.info("Raw file already exists at %s — skipping scrape.", raw_path)
+        return process_raw(raw_path, processed_path)
 
-    from collections import Counter
-    print("\nCategory breakdown (primary label):")
-    for cat, cnt in Counter(r["category"].split("|")[0] for r in clean).most_common():
-        print("  {:<20} {:>6,}".format(cat, cnt))
+    # ── Scrape from scratch ───────────────────────────────────────────────────
+    start_dt = date.fromisoformat(start)
+    end_dt   = date.fromisoformat(end)
+    pending  = [
+        (start_dt + timedelta(n)).strftime("%Y-%m-%d")
+        for n in range((end_dt - start_dt).days + 1)
+    ]
+    log.info("Dates to scrape: %d  (%s -> %s)", len(pending), start_dt, end_dt)
 
-    os.makedirs(os.path.dirname(FINAL_CSV), exist_ok=True)
-    with open(FINAL_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(clean)
-    print("\nSaved -> {}  ({:,} articles)".format(FINAL_CSV, len(clean)))
+    results, seen_urls = [], set()
+
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(_scrape(pending, raw_path, results, seen_urls))
+
+    return process_raw(raw_path, processed_path)
 
 
 if __name__ == "__main__":
-    if not already_complete():
-        asyncio.run(scrape())
-        process()
+    run()
