@@ -40,11 +40,11 @@ _WARMUP_ROWS = 252
 
 # ── Ticker → Category mapping ─────────────────────────────────────────────────
 CATEGORY_TICKERS = {
-    "macro"     : ["DGKC", "EFERT", "FFC", "FATIMA"],
-    "energy"    : ["HUBC", "KAPCO", "MARI", "OGDC", "POL", "PPL", "PSO"],
     "banking"   : ["BAFL", "HBL", "MCB", "NBP", "UBL"],
-    "forex"     : ["SYS", "TRG", "SEARL", "FEROZ", "NML", "NCL"],
-    "corporate" : ["AVN", "ENGRO", "GATM", "INDU", "LUCK", "MLCF", "PIOC", "PSMC"],
+    "energy"    : ["HUBC", "KAPCO", "MARI", "OGDC", "POL", "PPL", "PSO"],
+    "macro"     : ["DGKC", "EFERT", "FATIMA", "FFC", "LUCK", "MLCF", "PIOC"],
+    "forex"     : ["AVN", "GATM", "NCL", "NML", "SYS", "TRG"],
+    "corporate" : ["ENGRO", "FEROZ", "INDU", "PSMC", "SEARL"],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
