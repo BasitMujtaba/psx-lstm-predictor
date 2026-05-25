@@ -1,11 +1,47 @@
-import asyncio
+"""
+================================================================================
+ File   : src/data_collection/mettis_scraper.py
+ Project: PSX LSTM Predictor
+ Purpose: Scrapes financial news from Mettis Global for Pakistan market via
+          JSON API endpoints. Filters, deduplicates, and saves processed CSV.
+
+ Saves:
+   data/raw/news/mettis_pakistan_raw.csv
+   data/processed/news/mettis_pakistan_processed.csv
+
+ Cache logic:
+   1. If raw CSV exists -> skip scraping entirely, go straight to processing
+   2. If raw CSV does not exist -> scrape from scratch
+================================================================================
+"""
+
+import asyncio, csv, os, random, re, json, logging
+import pandas as pd
 import httpx
-import re
-import csv
-import os
-import json
-import random
+import yaml
 from tqdm import tqdm
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def load_config(path=None):
+    if path is None:
+        path = os.path.join(PROJECT_ROOT, "config.yaml")
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+def _resolve(cfg_path):
+    if os.path.isabs(cfg_path):
+        return cfg_path
+    return os.path.join(PROJECT_ROOT, cfg_path)
+
+
+# ── Filters ───────────────────────────────────────────────────────────────────
 
 FOREIGN_SIGNALS = (
     r"\b(european[ ]stock|europe[ ]stock|asian[ ]markets|asian[ ]stocks"
@@ -115,10 +151,6 @@ CATEGORIES = [
 ]
 
 LOAD_MORE_URL = "https://mettisglobal.news/Home/LoadMore"
-
-RAW_CSV       = "data/raw/news/mettis_pakistan_raw.csv"
-PROGRESS_FILE = "data/mettis_progress.txt"
-FINAL_CSV     = "data/processed/mettis_news_processed.csv"
 FIELDNAMES    = ["id", "date", "category", "subcategory", "title", "description", "url"]
 
 USER_AGENTS = [
@@ -127,6 +159,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def should_keep(title: str, description: str = "", api_category: str = "") -> bool:
     text = "{} {}".format(title, description).strip()
@@ -150,17 +184,6 @@ def get_subcategories(text: str) -> str:
     return "|".join(cats) if cats else "general_market"
 
 
-def load_done() -> set:
-    done = set()
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            for line in f:
-                s = line.strip()
-                if s:
-                    done.add(s)
-    return done
-
-
 def extract_id(item):
     return (item.get("NewsID") or item.get("newsID") or
             item.get("NewsId") or item.get("newsId"))
@@ -179,7 +202,6 @@ def parse_articles(data):
                         item.get("PublishedTime")  or item.get("publishedTime")  or
                         item.get("CreatedDate")    or "")
             if dt: dt = dt[:10]
-
             heading = description = ""
             h = item.get("Headings") or item.get("headings") or {}
             if isinstance(h, dict):
@@ -189,13 +211,65 @@ def parse_articles(data):
             if isinstance(d, dict):
                 dl = d.get("Description") or d.get("description") or []
                 if dl: description = dl[0] if isinstance(dl, list) else dl
-
             if news_id and heading:
                 articles.append((news_id, dt, heading, description, link, cat_name))
         except Exception:
             pass
     return articles
 
+
+# ── Processing ────────────────────────────────────────────────────────────────
+
+def process_raw(raw_path: str, processed_path: str) -> pd.DataFrame:
+    """
+    Reads raw CSV, deduplicates on id then title, applies should_keep filter,
+    refreshes subcategory column, sorts by date, saves to processed_path.
+    Returns the processed DataFrame.
+    """
+    log.info("Processing raw file: %s", raw_path)
+    df = pd.read_csv(raw_path, dtype={"id": str})
+    raw_count = len(df)
+
+    # Deduplicate on id
+    before = len(df)
+    df = df.drop_duplicates(subset=["id"]).reset_index(drop=True)
+    log.info("ID dedup: %d -> %d rows (removed %d)", before, len(df), before - len(df))
+
+    # Deduplicate on title
+    before = len(df)
+    df["_title_key"] = df["title"].str.strip().str.lower()
+    df = df.drop_duplicates(subset=["_title_key"]).drop(columns=["_title_key"]).reset_index(drop=True)
+    log.info("Title dedup: %d -> %d rows (removed %d)", before, len(df), before - len(df))
+
+    # Re-apply filter
+    mask = df.apply(
+        lambda r: should_keep(
+            str(r.get("title", "")),
+            str(r.get("description", "")),
+            str(r.get("category", ""))
+        ), axis=1
+    )
+    df = df[mask].copy()
+    log.info("Filter: %d -> %d rows (removed %d)", raw_count, len(df), raw_count - len(df))
+
+    # Refresh subcategory column
+    df["subcategory"] = df.apply(
+        lambda r: get_subcategories("{} {}".format(r.get("title", ""), r.get("description", ""))),
+        axis=1
+    )
+
+    # Sort by date
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+
+    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+    df.to_csv(processed_path, index=False)
+    log.info("Saved processed file -> %s  (%d rows)", processed_path, len(df))
+    return df
+
+
+# ── Scraper internals ─────────────────────────────────────────────────────────
 
 async def fetch_json(client, url, params=None):
     for attempt in range(3):
@@ -251,18 +325,18 @@ async def scrape_category(client, cat_key, seed_url, cat_param,
 
     data = await fetch_json(client, seed_url)
     if not data:
-        print("  [{}] seed failed".format(cat_key))
+        log.warning("[%s] seed failed", cat_key)
         return 0
 
     articles = parse_articles(data)
     if not articles:
-        print("  [{}] no articles in seed".format(cat_key))
+        log.warning("[%s] no articles in seed", cat_key)
         return 0
 
     total_rowid    = data[0].get("rowid", 0)
     cursor         = min(item.get("rowid") or 999999 for item in data if isinstance(item, dict))
     working_params = None
-    print("  [{}] total={} | starting cursor={}".format(cat_key, total_rowid, cursor))
+    log.info("[%s] total=%s | starting cursor=%s", cat_key, total_rowid, cursor)
 
     def write_batch(batch):
         nonlocal new_rows
@@ -304,7 +378,7 @@ async def scrape_category(client, cat_key, seed_url, cat_param,
         if not load_data:
             consecutive_empty += 1
             if consecutive_empty >= 3:
-                print("  [{}] LoadMore exhausted at cursor={}".format(cat_key, cursor))
+                log.info("[%s] LoadMore exhausted at cursor=%s", cat_key, cursor)
                 break
             await asyncio.sleep(2)
             continue
@@ -320,7 +394,7 @@ async def scrape_category(client, cat_key, seed_url, cat_param,
         if new_cursor >= cursor:
             consecutive_empty += 1
             if consecutive_empty >= 3:
-                print("  [{}] no cursor progress, stopping at cursor={}".format(cat_key, cursor))
+                log.info("[%s] no cursor progress, stopping at cursor=%s", cat_key, cursor)
                 break
             await asyncio.sleep(1)
             continue
@@ -329,116 +403,62 @@ async def scrape_category(client, cat_key, seed_url, cat_param,
         pbar.set_postfix_str("{} cursor={} rows={:,}".format(cat_key, cursor, new_rows))
         await asyncio.sleep(0.3)
 
-    print("  [{}] done | +{} rows | total={:,}".format(cat_key, new_rows, len(results)))
+    log.info("[%s] done | +%d rows | total=%d", cat_key, new_rows, len(results))
     return new_rows
 
 
-async def scrape():
+async def _scrape(raw_path):
     results  = []
     seen_ids = set()
 
-    done = load_done()
-    if os.path.exists(RAW_CSV):
-        with open(RAW_CSV, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                results.append(row)
-                try: seen_ids.add(int(row["id"]))
-                except: pass
-        print("Resuming — {:,} rows already saved".format(len(results)))
-
-    pending = [(k, s, p) for k, s, p in CATEGORIES if k not in done]
-    print("Categories pending: {} / {}".format(len(pending), len(CATEGORIES)))
-    if not pending:
-        print("Scraping already complete.")
-        return
-
-    os.makedirs(os.path.dirname(RAW_CSV),       exist_ok=True)
-    os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
-
-    csv_f  = open(RAW_CSV, "a", newline="", encoding="utf-8")
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    csv_f  = open(raw_path, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(csv_f, fieldnames=FIELDNAMES)
-    if os.path.getsize(RAW_CSV) == 0:
+    if os.path.getsize(raw_path) == 0:
         writer.writeheader()
-    progress_f = open(PROGRESS_FILE, "a", encoding="utf-8")
 
     async with httpx.AsyncClient(
         follow_redirects=True,
         limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
     ) as client:
-        pbar = tqdm(total=len(pending), desc="Scraping Mettis", unit="cat")
-        for cat_key, seed_url, cat_param in pending:
+        pbar = tqdm(total=len(CATEGORIES), desc="Mettis", unit="cat")
+        for cat_key, seed_url, cat_param in CATEGORIES:
             await scrape_category(client, cat_key, seed_url, cat_param,
                                    seen_ids, results, writer, csv_f, pbar)
-            progress_f.write(cat_key + "\n")
-            progress_f.flush()
             pbar.update(1)
             await asyncio.sleep(1)
         pbar.close()
 
     csv_f.close()
-    progress_f.close()
-    print("\nScraping done! {:,} rows -> {}".format(len(results), RAW_CSV))
+    log.info("Scraping done — %d rows -> %s", len(results), raw_path)
 
 
-def process():
-    print("\n-- Processing {} --".format(RAW_CSV))
-    with open(RAW_CSV, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    print("Loaded:            {:,} rows".format(len(rows)))
+# ── Public API ────────────────────────────────────────────────────────────────
 
-    seen_ids = set()
-    deduped  = []
-    for row in rows:
-        aid = str(row.get("id", "")).strip()
-        if aid and aid not in seen_ids:
-            seen_ids.add(aid)
-            deduped.append(row)
-    print("After ID dedup:    {:,} rows  (removed {:,})".format(len(deduped), len(rows) - len(deduped)))
+def run(cfg=None):
+    if cfg is None:
+        cfg = load_config()
 
-    seen_titles = set()
-    title_deduped = []
-    for row in deduped:
-        key = row.get("title", "").strip().lower()
-        if key not in seen_titles:
-            seen_titles.add(key)
-            title_deduped.append(row)
-    print("After title dedup: {:,} rows  (removed {:,})".format(len(title_deduped), len(deduped) - len(title_deduped)))
+    news_dir = _resolve(cfg["data"]["raw_news_dir"])
+    raw_path = os.path.join(news_dir, "mettis_pakistan_raw.csv")
 
-    clean, excluded = [], []
-    for row in title_deduped:
-        title       = row.get("title", "")
-        description = row.get("description", "")
-        cat_key     = row.get("category", "")
-        if should_keep(title, description, cat_key):
-            combined           = "{} {}".format(title, description)
-            row["subcategory"] = get_subcategories(combined)
-            clean.append(row)
-        else:
-            excluded.append(title)
+    processed_dir  = os.path.join(PROJECT_ROOT, "data", "processed", "news")
+    processed_path = os.path.join(processed_dir, "mettis_pakistan_processed.csv")
 
-    print("After filter:      {:,} rows  (removed {:,})".format(len(clean), len(title_deduped) - len(clean)))
+    os.makedirs(news_dir, exist_ok=True)
 
-    if excluded:
-        print("\nSample removed:")
-        for t in excluded[:10]:
-            print("  x  " + t)
+    # ── If raw file already exists, skip scraping entirely ────────────────────
+    if os.path.exists(raw_path):
+        log.info("Raw file already exists at %s — skipping scrape.", raw_path)
+        return process_raw(raw_path, processed_path)
 
-    print("\nSample kept:")
-    for r in clean[:10]:
-        print("  ok  [{}]  {}".format(r["subcategory"], r["title"]))
+    # ── Scrape from scratch ───────────────────────────────────────────────────
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(_scrape(raw_path))
 
-    from collections import Counter
-    print("\nSubcategory breakdown (primary label):")
-    for cat, cnt in Counter(r["subcategory"].split("|")[0] for r in clean).most_common():
-        print("  {:<20} {:>6,}".format(cat, cnt))
-
-    with open(FINAL_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(clean)
-    print("\nSaved -> {}  ({:,} articles)".format(FINAL_CSV, len(clean)))
+    return process_raw(raw_path, processed_path)
 
 
 if __name__ == "__main__":
-    asyncio.run(scrape())
-    process()
+    run()
