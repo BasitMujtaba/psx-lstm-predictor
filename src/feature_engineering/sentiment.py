@@ -6,14 +6,7 @@ Stage 1 - Inference
     (ProsusAI/finbert) in batches and writes per-article scores to
     data/processed/news/news_sentiment.csv.
 
-Stage 2 - Aggregation
-    Pivots the per-article scores into one row per calendar date with
-    one set of columns per news category (macro, energy, banking,
-    forex, corporate).  Result is written to
-    data/processed/news/news_sentiment_daily.csv and is ready to be
-    merged with psx_prices_processed.csv on the date column.
-
-Stage 3 - Category-Pivoted CSV
+Stage 2 - Category-Pivoted CSV
     Creates a new CSV with one row per date+category combination.
     Columns: date, category, title, sentiment_macro, sentiment_energy,
     sentiment_banking, sentiment_forex, sentiment_corporate.
@@ -34,7 +27,6 @@ BASE_DIR    = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 NEWS_DIR    = os.path.join(BASE_DIR, "data", "processed", "news")
 INPUT_PATH  = os.path.join(NEWS_DIR, "news_processed.csv")
 ARTICLE_OUT = os.path.join(NEWS_DIR, "news_sentiment.csv")
-DAILY_OUT   = os.path.join(NEWS_DIR, "news_sentiment_daily.csv")
 PIVOTED_OUT = os.path.join(NEWS_DIR, "news_sentiment_pivoted.csv")
 
 MODEL_NAME  = "ProsusAI/finbert"
@@ -105,63 +97,6 @@ def run_inference(df):
     return out_df
 
 
-def aggregate_by_category(df):
-    required = {"date", "category", "sentiment_compound", "sentiment_label"}
-    missing  = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns for aggregation: {missing}")
-
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-
-    date_spine = pd.DataFrame(
-        {"date": pd.date_range(df["date"].min(), df["date"].max(), freq="D")}
-    )
-
-    agg_frames = [date_spine.set_index("date")]
-
-    for cat in CATEGORIES:
-        cat_df = df[df["category"] == cat]
-
-        if cat_df.empty:
-            print(f"[sentiment] WARNING: No articles found for category {cat}")
-            empty = date_spine.copy()
-            for suffix in ("mean", "std", "count", "pos_ratio", "neg_ratio"):
-                empty[f"sentiment_{cat}_{suffix}"] = 0.0
-            agg_frames.append(empty.set_index("date"))
-            continue
-
-        def pos_ratio(x):
-            return (x == "positive").sum() / len(x) if len(x) else 0.0
-
-        def neg_ratio(x):
-            return (x == "negative").sum() / len(x) if len(x) else 0.0
-
-        daily = (
-            cat_df
-            .groupby("date")
-            .agg(**{
-                f"sentiment_{cat}_mean"     : ("sentiment_compound", "mean"),
-                f"sentiment_{cat}_std"      : ("sentiment_compound", "std"),
-                f"sentiment_{cat}_count"    : ("sentiment_compound", "count"),
-                f"sentiment_{cat}_pos_ratio": ("sentiment_label",    pos_ratio),
-                f"sentiment_{cat}_neg_ratio": ("sentiment_label",    neg_ratio),
-            })
-        )
-        agg_frames.append(daily)
-
-    result = pd.concat(agg_frames, axis=1).reset_index()
-    result.rename(columns={"index": "date"}, inplace=True)
-    result["date"] = pd.to_datetime(result["date"])
-
-    sent_cols = [c for c in result.columns if c.startswith("sentiment_")]
-    result[sent_cols] = result[sent_cols].fillna(0)
-
-    result.sort_values("date", inplace=True)
-    result.reset_index(drop=True, inplace=True)
-    return result
-
-
 def build_pivoted(df):
     required = {"date", "category", "title", "sentiment_compound"}
     missing  = required - set(df.columns)
@@ -196,7 +131,7 @@ def build_pivoted(df):
     return grouped
 
 
-def print_summary(article_df, daily_df, pivoted_df):
+def print_summary(article_df, pivoted_df):
     print("\n" + "=" * 60)
     print("SENTIMENT SUMMARY")
     print("=" * 60)
@@ -207,12 +142,6 @@ def print_summary(article_df, daily_df, pivoted_df):
     print("\n-- Mean compound score by category --")
     if "category" in article_df.columns:
         print(article_df.groupby("category")["sentiment_compound"].mean().round(4).to_string())
-
-    print("\n-- Daily aggregated table --")
-    print(f"  {daily_df.shape[0]:,} rows x {daily_df.shape[1]} columns")
-    date_min = daily_df["date"].min().date()
-    date_max = daily_df["date"].max().date()
-    print(f"  Date range: {date_min} to {date_max}")
 
     print("\n-- Pivoted table --")
     print(f"  {pivoted_df.shape[0]:,} rows x {pivoted_df.shape[1]} columns")
@@ -241,18 +170,13 @@ def run(agg_only=False):
     else:
         article_df = run_inference(news_df)
 
-    print("[sentiment] Aggregating sentiment by date x category ...")
-    daily_df = aggregate_by_category(article_df)
-    os.makedirs(NEWS_DIR, exist_ok=True)
-    daily_df.to_csv(DAILY_OUT, index=False)
-    print(f"[sentiment] Saved {len(daily_df):,} daily rows to {DAILY_OUT}")
-
     print("[sentiment] Building category-pivoted CSV ...")
     pivoted_df = build_pivoted(article_df)
+    os.makedirs(NEWS_DIR, exist_ok=True)
     pivoted_df.to_csv(PIVOTED_OUT, index=False)
     print(f"[sentiment] Saved {len(pivoted_df):,} pivoted rows to {PIVOTED_OUT}")
 
-    print_summary(article_df, daily_df, pivoted_df)
+    print_summary(article_df, pivoted_df)
 
 
 if __name__ == "__main__":
