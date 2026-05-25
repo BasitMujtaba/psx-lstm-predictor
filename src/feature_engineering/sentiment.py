@@ -177,6 +177,7 @@ def run(agg_only=False):
     print(f"[sentiment] Saved {len(pivoted_df):,} pivoted rows to {PIVOTED_OUT}")
 
     print_summary(article_df, pivoted_df)
+    return article_df, pivoted_df
 
 
 if __name__ == "__main__":
