@@ -7,6 +7,7 @@ classification (UP=1 / DOWN=0).
 Architecture
 ------------
   Input (B, seq_len, n_features)
+    -> Input Dropout
     -> Linear input projection + LayerNorm
     -> Bidirectional LSTM
     -> Dropout
@@ -24,10 +25,10 @@ config.yaml keys used
 ---------------------
   model:
     input_size:   31
-    lstm_hidden:  64
+    lstm_hidden:  32
     lstm_layers:  1
-    lstm_dropout: 0.3
-    fc_hidden:    64
+    lstm_dropout: 0.6
+    fc_hidden:    32
     use_ensemble: false
 """
 
@@ -48,16 +49,19 @@ class PSXLSTMModel(nn.Module):
     Parameters
     ----------
     input_size  : number of input features  (default 31)
-    hidden_size : LSTM hidden dimension     (default 64)
+    hidden_size : LSTM hidden dimension     (default 32)
     num_layers  : LSTM depth                (default 1)
-    dropout     : dropout rate             (default 0.3)
-    fc_hidden   : FC head hidden dim       (default 64)
+    dropout     : dropout rate             (default 0.6)
+    fc_hidden   : FC head hidden dim       (default 32)
     """
 
-    def __init__(self, input_size=31, hidden_size=64,
-                 num_layers=1, dropout=0.3, fc_hidden=64,
-                 **kwargs):   # absorbs unused keys like num_heads, cross_heads
+    def __init__(self, input_size=31, hidden_size=32,
+                 num_layers=1, dropout=0.6, fc_hidden=32,
+                 **kwargs):
         super().__init__()
+
+        # -- input dropout (applied to raw features before projection)
+        self.input_drop = nn.Dropout(dropout * 0.5)   # lighter on raw input
 
         # -- input projection
         self.input_proj = nn.Sequential(
@@ -118,6 +122,7 @@ class PSXLSTMModel(nn.Module):
         -------
         pooled : (B, hidden_size * 4)
         """
+        x   = self.input_drop(x)              # input dropout on raw features
         x   = self.input_proj(x)              # (B, T, H)
         out, _ = self.lstm(x)                 # (B, T, H*2)
         out = self.lstm_drop(out)
@@ -244,22 +249,14 @@ class TreeEnsemble:
 def build_model(cfg):
     """
     Instantiates PSXLSTMModel from config.yaml model section.
-
-    Parameters
-    ----------
-    cfg : dict  (loaded config.yaml)
-
-    Returns
-    -------
-    PSXLSTMModel
     """
     m     = cfg.get("model", {})
     model = PSXLSTMModel(
         input_size  = m.get("input_size",    31),
-        hidden_size = m.get("lstm_hidden",   64),
+        hidden_size = m.get("lstm_hidden",   32),
         num_layers  = m.get("lstm_layers",    1),
-        dropout     = m.get("lstm_dropout", 0.3),
-        fc_hidden   = m.get("fc_hidden",     64),
+        dropout     = m.get("lstm_dropout", 0.6),
+        fc_hidden   = m.get("fc_hidden",     32),
     )
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Model built: PSXLSTMModel | trainable params: %s", f"{n:,}")
