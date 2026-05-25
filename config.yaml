@@ -76,21 +76,21 @@ features:
     - "near_lower_circuit"
     - "day_of_week"
     - "month"
-    - "sentiment_macro"
-    - "sentiment_energy"
+    - "sentiment_relevant"
+    - "sentiment_ticker"
     - "news_count"
   target:      "target"
   n_features:  31
 
 model:
   input_size:      31
-  seq_len:         20        # reduced from 30 — shorter lookback reduces memorization
-  lstm_hidden:     32        # reduced from 64 — less capacity
+  seq_len:         20
+  lstm_hidden:     32
   lstm_layers:     1
   lstm_dropout:    0.6
   num_heads:       2
   cross_heads:     1
-  fc_hidden:       32        # reduced from 64 — less capacity
+  fc_hidden:       32
   use_ensemble:    false
   xgb_trees:       300
   xgb_depth:       6
@@ -105,14 +105,14 @@ training:
   lr:            0.0003
   patience:      10
   grad_clip:     1.0
-  weight_decay:  0.02       # increased from 0.005 — stronger L2 regularization
+  weight_decay:  0.02
   lr_factor:     0.5
   lr_patience:   5
   num_workers:   2
   warmup_epochs: 3
   train_ratio:   0.70
   val_ratio:     0.15
-  label_smooth:  0.15       # increased from 0.1 — softer targets
+  label_smooth:  0.15
 
 news:
   finbert_model: "ProsusAI/finbert"
