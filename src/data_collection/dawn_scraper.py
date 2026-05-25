@@ -1,9 +1,48 @@
+"""
+================================================================================
+ File   : src/data_collection/dawn_scraper.py
+ Project: PSX LSTM Predictor
+ Purpose: Scrapes financial news headlines from Dawn for Pakistan market.
+          Filters, deduplicates, and saves processed CSV.
 
-import asyncio
-from playwright.async_api import async_playwright
+ Saves:
+   data/raw/news/dawn_pakistan_raw.csv
+   data/processed/news/dawn_pakistan_processed.csv
+
+ Cache logic:
+   1. If raw CSV exists -> skip scraping entirely, go straight to processing
+   2. If raw CSV does not exist -> scrape from scratch
+================================================================================
+"""
+
+import asyncio, csv, os, random, re, logging
+import pandas as pd
+import yaml
 from datetime import date, timedelta
-import re, csv, os, random
+from playwright.async_api import async_playwright
 from tqdm import tqdm
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def load_config(path=None):
+    if path is None:
+        path = os.path.join(PROJECT_ROOT, "config.yaml")
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+def _resolve(cfg_path):
+    if os.path.isabs(cfg_path):
+        return cfg_path
+    return os.path.join(PROJECT_ROOT, cfg_path)
+
+
+# ── Filters ───────────────────────────────────────────────────────────────────
 
 FOREIGN_SIGNALS = (
     r"\b(european[ ]stock|europe[ ]stock|asian[ ]markets|asian[ ]stocks"
@@ -133,12 +172,9 @@ CATEGORY_PATTERNS = {
     ),
 }
 
-RAW_CSV        = "data/raw/news/dawn_pakistan_raw.csv"
-PROGRESS_FILE  = "data/dawn_progress.txt"
-FINAL_CSV      = "data/processed/dawn_news_processed.csv"
+STICKY_IDS     = {"1984584"}
 FIELDNAMES     = ["date", "category", "title", "url"]
 ARTICLE_URL_RE = re.compile(r"dawn\.com/news/(\d+)")
-STICKY_IDS     = {"1984584"}
 TOTAL_WORKERS  = 4
 USER_AGENTS    = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
@@ -147,6 +183,8 @@ USER_AGENTS    = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def should_keep(title: str) -> bool:
     if not title or len(title) < 15:
@@ -169,16 +207,50 @@ def get_categories(title: str) -> str:
     return "|".join(cats) if cats else "general_market"
 
 
-def load_done() -> set:
-    done = set()
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            for line in f:
-                s = line.strip()
-                if s:
-                    done.add(s)
-    return done
+# ── Processing ────────────────────────────────────────────────────────────────
 
+def process_raw(raw_path: str, processed_path: str) -> pd.DataFrame:
+    """
+    Reads raw CSV, deduplicates on (url) then (date, title),
+    applies should_keep filter, refreshes category column,
+    sorts by date, saves to processed_path.
+    Returns the processed DataFrame.
+    """
+    log.info("Processing raw file: %s", raw_path)
+    df = pd.read_csv(raw_path)
+    raw_count = len(df)
+
+    # Deduplicate on URL
+    before = len(df)
+    df["url"] = df["url"].str.strip().str.rstrip("/").str.lower()
+    df = df.drop_duplicates(subset=["url"]).reset_index(drop=True)
+    log.info("URL dedup: %d -> %d rows (removed %d)", before, len(df), before - len(df))
+
+    # Deduplicate on (date, title)
+    before = len(df)
+    df = df.drop_duplicates(subset=["date", "title"]).reset_index(drop=True)
+    log.info("Title dedup: %d -> %d rows (removed %d)", before, len(df), before - len(df))
+
+    # Re-apply filter
+    mask = df["title"].apply(should_keep)
+    df   = df[mask].copy()
+    log.info("Filter: %d -> %d rows (removed %d)", raw_count, len(df), raw_count - len(df))
+
+    # Refresh category column
+    df["category"] = df["title"].apply(get_categories)
+
+    # Sort by date
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+
+    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+    df.to_csv(processed_path, index=False)
+    log.info("Saved processed file -> %s  (%d rows)", processed_path, len(df))
+    return df
+
+
+# ── Scraper internals ─────────────────────────────────────────────────────────
 
 async def new_page(browser):
     ctx = await browser.new_context(
@@ -248,7 +320,7 @@ async def scrape_date(page, date_str: str, seen_urls: set, seen_lock) -> list:
 
 
 async def worker(wid, queue, browser, seen_urls, seen_lock,
-                 results, csv_f, writer, progress_f, pbar):
+                 results, csv_f, writer, pbar):
     ctx, page = await new_page(browser)
     while True:
         date_str = await queue.get()
@@ -271,58 +343,30 @@ async def worker(wid, queue, browser, seen_urls, seen_lock,
             results.append(row)
             writer.writerow(row)
         csv_f.flush()
-        progress_f.write(date_str + "\n")
-        progress_f.flush()
         pbar.update(1)
         pbar.set_postfix_str(f"{len(results):,} articles")
         queue.task_done()
 
 
-async def scrape():
-    results   = []
-    seen_urls = set()
+async def _scrape(pending, raw_path, results, seen_urls):
     seen_lock = asyncio.Lock()
-
-    start     = date(2010, 1, 1)
-    end       = date(2026, 12, 31)
-    all_dates = [(start + timedelta(n)).strftime("%Y-%m-%d")
-                 for n in range((end - start).days + 1)]
-
-    done_tasks = load_done()
-    if os.path.exists(RAW_CSV):
-        with open(RAW_CSV, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                seen_urls.add(row["url"].strip().rstrip("/"))
-                results.append(row)
-        print(f"Resuming — {len(results):,} articles, {len(done_tasks):,} dates done")
-
-    pending = [d for d in all_dates if d not in done_tasks]
-    print(f"Dates remaining: {len(pending):,} / {len(all_dates):,}")
-    if not pending:
-        print("Scraping already complete.")
-        return
-
-    os.makedirs(os.path.dirname(RAW_CSV),       exist_ok=True)
-    os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
-
-    csv_f  = open(RAW_CSV, "a", newline="", encoding="utf-8")
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    csv_f  = open(raw_path, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(csv_f, fieldnames=FIELDNAMES)
-    if os.path.getsize(RAW_CSV) == 0:
+    if os.path.getsize(raw_path) == 0:
         writer.writeheader()
-    progress_f = open(PROGRESS_FILE, "a", encoding="utf-8")
 
     pw       = await async_playwright().start()
-    browsers = [await pw.firefox.launch(headless=False) for _ in range(TOTAL_WORKERS)]
-    print(f"Launched {len(browsers)} browsers OK")
+    browsers = [await pw.firefox.launch(headless=True) for _ in range(TOTAL_WORKERS)]
+    log.info("Launched %d browsers", len(browsers))
 
     try:
         queue = asyncio.Queue(maxsize=TOTAL_WORKERS * 4)
-        pbar  = tqdm(total=len(pending), desc="Scraping Dawn", unit="date")
-        pbar.set_postfix_str(f"{len(results):,} articles")
+        pbar  = tqdm(total=len(pending), desc="Dawn", unit="date")
         tasks = [
             asyncio.create_task(
                 worker(i, queue, browsers[i], seen_urls, seen_lock,
-                       results, csv_f, writer, progress_f, pbar)
+                       results, csv_f, writer, pbar)
             )
             for i in range(TOTAL_WORKERS)
         ]
@@ -335,74 +379,51 @@ async def scrape():
         pbar.close()
     finally:
         csv_f.close()
-        progress_f.close()
         for b in browsers:
             try: await b.close()
             except Exception: pass
         await pw.stop()
-    print(f"\nScraping done! {len(results):,} articles → {RAW_CSV}")
+    log.info("Scraping done — %d articles -> %s", len(results), raw_path)
 
 
-def process():
-    if os.path.exists(FINAL_CSV):
-        print(f"✅ Processed file already exists: {FINAL_CSV}  — skipping.")
-        return
+# ── Public API ────────────────────────────────────────────────────────────────
 
-    print(f"\n── Processing {RAW_CSV} ──")
-    with open(RAW_CSV, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    print(f"Loaded:            {len(rows):,} rows")
+def run(cfg=None):
+    if cfg is None:
+        cfg = load_config()
 
-    url_map = {}
-    for row in rows:
-        key = row["url"].strip().rstrip("/").lower()
-        if key not in url_map:
-            url_map[key] = row
-    merged = list(url_map.values())
-    print(f"After URL dedup:   {len(merged):,} rows  (removed {len(rows)-len(merged):,})")
+    start    = str(cfg["data"]["start_date"])
+    end      = str(cfg["data"]["end_date"])
+    news_dir = _resolve(cfg["data"]["raw_news_dir"])
+    raw_path = os.path.join(news_dir, "dawn_pakistan_raw.csv")
 
-    seen_titles = set()
-    deduped     = []
-    for row in merged:
-        key = row["title"].strip().lower()
-        if key not in seen_titles:
-            seen_titles.add(key)
-            deduped.append(row)
-    print(f"After title dedup: {len(deduped):,} rows  (removed {len(merged)-len(deduped):,})")
+    processed_dir  = os.path.join(PROJECT_ROOT, "data", "processed", "news")
+    processed_path = os.path.join(processed_dir, "dawn_pakistan_processed.csv")
 
-    clean, excluded = [], []
-    for row in deduped:
-        if should_keep(row["title"]):
-            row["category"] = get_categories(row["title"])
-            clean.append(row)
-        else:
-            excluded.append(row["title"])
-    print(f"After filter:      {len(clean):,} rows  (removed {len(deduped)-len(clean):,})")
+    os.makedirs(news_dir, exist_ok=True)
 
-    if excluded:
-        print("\nSample removed:")
-        for t in excluded[:10]:
-            print(f"  ✗  {t}")
+    # ── If raw file already exists, skip scraping entirely ────────────────────
+    if os.path.exists(raw_path):
+        log.info("Raw file already exists at %s — skipping scrape.", raw_path)
+        return process_raw(raw_path, processed_path)
 
-    print("\nSample kept:")
-    for r in clean[:10]:
-        print(f"  ✓  [{r['category']}]  {r['title']}")
+    # ── Scrape from scratch ───────────────────────────────────────────────────
+    start_dt = date.fromisoformat(start)
+    end_dt   = date.fromisoformat(end)
+    pending  = [
+        (start_dt + timedelta(n)).strftime("%Y-%m-%d")
+        for n in range((end_dt - start_dt).days + 1)
+    ]
+    log.info("Dates to scrape: %d  (%s -> %s)", len(pending), start_dt, end_dt)
 
-    from collections import Counter
-    print("\nCategory breakdown (primary label):")
-    for cat, cnt in Counter(r["category"].split("|")[0] for r in clean).most_common():
-        print(f"  {cat:<20} {cnt:>6,}")
+    results, seen_urls = [], set()
 
-    with open(FINAL_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(clean)
-    print(f"\nSaved → {FINAL_CSV}  ({len(clean):,} articles)")
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(_scrape(pending, raw_path, results, seen_urls))
+
+    return process_raw(raw_path, processed_path)
 
 
 if __name__ == "__main__":
-    if os.path.exists(FINAL_CSV):
-        print(f"✅ {FINAL_CSV} already exists. Nothing to do.")
-    else:
-        asyncio.run(scrape())
-        process()
+    run()
