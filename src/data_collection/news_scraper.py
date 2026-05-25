@@ -18,10 +18,10 @@
           data/processed/news_aggregated_decay_catwise.csv <- category-wise decay (on filtered)
 
  Cache logic:
-   1. Raw CSVs exist -> merge + dedupe + score + save + push merged,
+   1. Processed CSVs exist -> merge + dedupe + score + save + push merged,
       then filter + save + push filtered,
       then aggregate + push
-   2. Raw CSVs missing -> raise error, run scrapers first
+   2. Processed CSVs missing -> raise error, run scrapers first
 ================================================================================
 """
 
@@ -37,12 +37,11 @@ from tqdm import tqdm
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR  = Path(__file__).resolve().parents[2]
 PROCESSED = BASE_DIR / "data" / "processed"
-RAW_NEWS  = BASE_DIR / "data" / "raw" / "news"
 
 RAW_NEWS_FILES = {
-    "dawn"      : RAW_NEWS / "dawn_pakistan_raw.csv",
-    "brecorder" : RAW_NEWS / "brecorder_pakistan_raw.csv",
-    "mettis"    : RAW_NEWS / "mettis_pakistan_raw.csv",
+    "dawn"      : PROCESSED / "dawn_news_processed.csv",
+    "brecorder" : PROCESSED / "brecorder_news_processed.csv",
+    "mettis"    : PROCESSED / "mettis_news_processed.csv",
 }
 
 OUTPUT_PATH   = PROCESSED / "news_merged.csv"
@@ -82,9 +81,6 @@ DECAY_FACTORS = {
 }
 
 # ── Category Mapping ──────────────────────────────────────────────────────────
-# Maps raw scraper categories -> standardized internal categories
-# banking kept as banking (was wrongly mapped to corporate before)
-# general_market, general, rates, stocks, exchange added
 CATEGORY_MAP = {
     "macro"                : "macro",
     "fiscal"               : "macro",
@@ -111,8 +107,6 @@ CATEGORY_MAP = {
 }
 
 # ── Sector Keyword Detection ──────────────────────────────────────────────────
-# Applied AFTER category mapping to override category based on title keywords
-# Covers sectors not present as raw categories in any scraper
 SECTOR_KEYWORDS = {
     "cement"      : [
         "cement", "clinker", "lucky cement", "dgkc", "dg khan cement",
@@ -502,7 +496,7 @@ NON_ECONOMIC = [
     "cricket gold medal", "cricket gold",
     "football match", "hockey tournament",
     "world cup squad", "test match", "odi series",
-    r"\bppfl\b", "premier football league", "pakistan premier football league",
+    r"ppfl", "premier football league", "pakistan premier football league",
     "ppl.*football", "ppl balochistan football", "balochistan football cup",
     "national hockey", "national hockey championship", "national hockey opener",
     "hockey players", "hockey gold", "hockey silver", "hockey team returns",
@@ -529,7 +523,7 @@ NON_ECONOMIC = [
     "wapda players shine.*games", "wapda.*south asian games",
     "wapda honours.*players",
     "vintage car rally", "vintage.*rally", "classic car rally",
-    r"\bcar rally\b", "peace car rally", "car rally.*waziristan",
+    r"car rally", "peace car rally", "car rally.*waziristan",
     "karachi chronicle",
     "fans share.*encounters.*cricketers",
     "cricketer.*shares.*teaser.*drama", "cricketer.*shares.*teaser.*series",
@@ -573,32 +567,32 @@ NON_ECONOMIC = [
 ]
 
 GOLD_TICKER_PATTERN = re.compile(
-    r'gold price[s]?\s+(per tola|gains|sheds|drops|falls|rises|jumps|'
-    r'increases|decreases|declines|dips|soars|remains|surges|plunges|'
-    r'climbs|edges|goes|went|up by|up rs|down by|gain|shed|drop|fall|rise|'
-    r'jump|stable|unchanged|flat|steady|recorded|traded|close|decreased|'
-    r'increased|decrease|increase|dip|slumps|nosedives|shoots|continues|'
+    r'gold price[s]?\s+(per tola|gains|sheds|drops|falls|rises|jumps|' 
+    r'increases|decreases|declines|dips|soars|remains|surges|plunges|' 
+    r'climbs|edges|goes|went|up by|up rs|down by|gain|shed|drop|fall|rise|' 
+    r'jump|stable|unchanged|flat|steady|recorded|traded|close|decreased|' 
+    r'increased|decrease|increase|dip|slumps|nosedives|shoots|continues|' 
     r'in domestic|makes history|remain|per 12)',
     re.IGNORECASE
 )
 GOLD_TICKER_PATTERN2 = re.compile(
-    r'(gold prices (per tola|increase rs|decline rs|increase by|decline by|'
-    r'remain (stable|unchanged|largely stable|steady)|fall by|fall for|'
-    r'reverse losing|in pakistan (hit|are|continue|near|remain|reach|soar)|'
-    r'soar to a new|finally exhibit|reach|come down|surge by|slip|'
-    r'plummet|clamber|climb|hold|edge|stable|steady|dull|decrease|'
+    r'(gold prices (per tola|increase rs|decline rs|increase by|decline by|' 
+    r'remain (stable|unchanged|largely stable|steady)|fall by|fall for|' 
+    r'reverse losing|in pakistan (hit|are|continue|near|remain|reach|soar)|' 
+    r'soar to a new|finally exhibit|reach|come down|surge by|slip|' 
+    r'plummet|clamber|climb|hold|edge|stable|steady|dull|decrease|' 
     r'jump by|gains rs|rise from|per 12 gram|per tola gains|per tola declines))',
     re.IGNORECASE
 )
 GOLD_KEEP_PATTERN = re.compile(
-    r'(why are gold prices|charities report.*gold prices|'
-    r'stocks.*oil.*gold prices jump|stocks fall.*oil.*gold prices jump|'
-    r'gold prices.*surpass rs\d|gold prices.*crosses rs\d|'
-    r'gold prices.*record high in pakistan.*surpass|'
-    r'gold prices in pakistan.*record rs\d|'
-    r'gold prices in pakistan soar to another record|'
-    r'gold prices (soar to record|hit record high in pakistan|'
-    r'reach record|near all-time high|hit fresh all-time|'
+    r'(why are gold prices|charities report.*gold prices|' 
+    r'stocks.*oil.*gold prices jump|stocks fall.*oil.*gold prices jump|' 
+    r'gold prices.*surpass rs\d|gold prices.*crosses rs\d|' 
+    r'gold prices.*record high in pakistan.*surpass|' 
+    r'gold prices in pakistan.*record rs\d|' 
+    r'gold prices in pakistan soar to another record|' 
+    r'gold prices (soar to record|hit record high in pakistan|' 
+    r'reach record|near all-time high|hit fresh all-time|' 
     r'in pakistan reach record|in pakistan hit record))',
     re.IGNORECASE
 )
@@ -662,21 +656,12 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Keyword-based Sector Recategorization ─────────────────────────────────────
 def recategorize_by_keywords(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    After standardize_category(), override category to a specific sector
-    if the article title contains sector-specific keywords.
-    This adds cement, fertilizer, auto, tech, pharma, textile categories
-    which do not exist as raw scraper categories.
-    More specific sectors take priority over generic corporate/macro.
-    """
     df   = df.copy()
     t    = df["title"].str.lower().fillna("")
-
     for sector, keywords in SECTOR_KEYWORDS.items():
         pattern = "|".join(re.escape(k) for k in keywords)
         mask    = t.str.contains(pattern, na=False)
         df.loc[mask, "category"] = sector
-
     counts = df["category"].value_counts()
     print(f"   Category distribution after keyword recategorization:")
     for cat, cnt in counts.items():
@@ -698,7 +683,6 @@ def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df["_norm"] = df["title"].fillna("").apply(_normalize_title)
-
     df["_priority"] = df["source"].map(SOURCE_PRIORITY).fillna(99)
     df.sort_values(["date", "_norm", "_priority"], inplace=True)
     df = df.drop_duplicates(subset=["date", "_norm"], keep="first")
@@ -737,7 +721,6 @@ def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
 
     df.sort_values("date", inplace=True)
     df = df.drop_duplicates(subset=["_norm"], keep="first")
-
     df = df.drop(columns=["_norm", "_priority"])
     df.reset_index(drop=True, inplace=True)
     dropped_total = before - len(df)
@@ -826,10 +809,11 @@ def merge_news() -> pd.DataFrame:
     raw_found = {k: v for k, v in RAW_NEWS_FILES.items() if v.exists()}
     if not raw_found:
         raise FileNotFoundError(
-            "No raw news CSVs found. Run dawn_scraper, brecorder_scraper, mettis_scraper first."
+            "No processed news CSVs found. Run dawn_scraper, brecorder_scraper, "
+            "mettis_scraper first and ensure processed CSVs exist in data/processed/."
         )
 
-    print(f"\n📰 Loading {len(raw_found)} raw CSVs ...")
+    print(f"\n📰 Loading {len(raw_found)} processed CSVs ...")
     dfs = []
     for source, path in raw_found.items():
         df = pd.read_csv(path)
@@ -851,8 +835,6 @@ def merge_news() -> pd.DataFrame:
     merged.sort_values("date", inplace=True)
     merged.reset_index(drop=True, inplace=True)
 
-    # keyword recategorization before dedup so sector articles
-    # get correct category going into aggregation
     print("\n🏷️  Applying keyword-based sector recategorization ...")
     merged = recategorize_by_keywords(merged)
 
@@ -969,7 +951,7 @@ def run():
     print("  PSX News Scraper — Full Pipeline")
     print("=" * 60)
 
-    print("\n📋 Raw CSV check:")
+    print("\n📋 Processed CSV check:")
     for source, path in RAW_NEWS_FILES.items():
         print(f"   {source:<12}: {'✅ exists' if path.exists() else '❌ missing'}")
 
