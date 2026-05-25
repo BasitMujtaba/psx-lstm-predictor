@@ -6,7 +6,7 @@ joins it onto the price data for both decay and flags variants.
 
 Also computes per-ticker sentiment from articles mentioning each
 ticker by name. Tickers with < 30 matching articles fall back to
-their category sentiment (energy or macro).
+their sector-relevant sentiment via TICKER_SECTOR_MAP.
 
 Outputs
 -------
@@ -62,8 +62,51 @@ TICKER_KEYWORDS = {
     "POL":    ["pol", "pakistan oilfields"],
 }
 
-ENERGY_TICKERS = {"OGDC", "PPL", "MARI", "PSO", "POL", "HUBC", "KAPCO"}
-MIN_ARTICLES   = 30
+MIN_ARTICLES = 30
+
+
+# ── EDIT 1: Ticker -> sector sentiment column mapping ─────────────────────────
+
+TICKER_SECTOR_MAP = {
+    # Energy
+    "OGDC":   "sentiment_energy",
+    "PPL":    "sentiment_energy",
+    "MARI":   "sentiment_energy",
+    "PSO":    "sentiment_energy",
+    "POL":    "sentiment_energy",
+    "HUBC":   "sentiment_energy",
+    "KAPCO":  "sentiment_energy",
+    # Banking
+    "HBL":    "sentiment_banking",
+    "MCB":    "sentiment_banking",
+    "UBL":    "sentiment_banking",
+    "NBP":    "sentiment_banking",
+    "BAFL":   "sentiment_banking",
+    # Fertilizer
+    "ENGRO":  "sentiment_fertilizer",
+    "EFERT":  "sentiment_fertilizer",
+    "FATIMA": "sentiment_fertilizer",
+    "FFC":    "sentiment_fertilizer",
+    # Cement
+    "LUCK":   "sentiment_cement",
+    "DGKC":   "sentiment_cement",
+    "MLCF":   "sentiment_cement",
+    "PIOC":   "sentiment_cement",
+    # Textile
+    "NML":    "sentiment_textile",
+    "NCL":    "sentiment_textile",
+    # Tech
+    "TRG":    "sentiment_tech",
+    "SYS":    "sentiment_tech",
+    "AVN":    "sentiment_tech",
+    # Pharma
+    "SEARL":  "sentiment_pharma",
+    "FEROZ":  "sentiment_pharma",
+    # Auto
+    "INDU":   "sentiment_auto",
+    "PSMC":   "sentiment_auto",
+    "GATM":   "sentiment_auto",
+}
 
 
 # ── GitHub push ───────────────────────────────────────────────────────────────
@@ -74,7 +117,7 @@ def _push_to_github(decay_path, flags_path):
             ["git", "-C", PROJECT_ROOT, "pull", "--rebase", "origin", "main"],
             ["git", "-C", PROJECT_ROOT, "add", decay_path, flags_path],
             ["git", "-C", PROJECT_ROOT, "commit", "-m",
-             "Update joined CSVs with per-ticker sentiment"],
+             "Update joined CSVs with per-ticker sentiment and sector-relevant sentiment"],
             ["git", "-C", PROJECT_ROOT, "push"],
         ]
         for cmd in cmds:
@@ -82,6 +125,39 @@ def _push_to_github(decay_path, flags_path):
         log.info("Pushed joined CSVs to GitHub")
     except subprocess.CalledProcessError as e:
         log.warning("GitHub push failed: %s", e.stderr.decode())
+
+
+# ── EDIT 2: Build sentiment_relevant column via TICKER_SECTOR_MAP ─────────────
+
+def _build_relevant_sentiment(df):
+    """
+    For each row, pick the sector sentiment column that corresponds to the
+    ticker's industry. Tickers not in TICKER_SECTOR_MAP fall back to
+    sentiment_macro. Result stored in sentiment_relevant.
+    """
+    df = df.copy()
+    df["sentiment_relevant"] = 0.0
+
+    for ticker, col in TICKER_SECTOR_MAP.items():
+        if col not in df.columns:
+            log.warning("Column %s not found for ticker %s, skipping", col, ticker)
+            continue
+        mask = df["ticker"] == ticker
+        df.loc[mask, "sentiment_relevant"] = df.loc[mask, col]
+
+    # Fallback: tickers not in map get sentiment_macro
+    unmapped_mask = ~df["ticker"].isin(TICKER_SECTOR_MAP)
+    if unmapped_mask.any():
+        if "sentiment_macro" in df.columns:
+            df.loc[unmapped_mask, "sentiment_relevant"] = df.loc[unmapped_mask, "sentiment_macro"]
+        unmapped_tickers = df.loc[unmapped_mask, "ticker"].unique().tolist()
+        log.info("sentiment_relevant: %d unmapped tickers defaulted to sentiment_macro: %s",
+                 len(unmapped_tickers), unmapped_tickers)
+
+    log.info("sentiment_relevant built — mean=%.4f  zeros=%.1f%%",
+             df["sentiment_relevant"].mean(),
+             (df["sentiment_relevant"] == 0).mean() * 100)
+    return df
 
 
 # ── Build per-ticker daily sentiment table ────────────────────────────────────
@@ -123,7 +199,7 @@ def _build_ticker_sentiment(news_path, trading_dates, tickers):
         used_ticker.append(ticker)
 
     log.info("Per-ticker sentiment built for %d tickers: %s", len(used_ticker), used_ticker)
-    log.info("Fallback to category for %d tickers: %s", len(used_fallback), used_fallback)
+    log.info("Fallback to sector sentiment for %d tickers: %s", len(used_fallback), used_fallback)
 
     if ticker_frames:
         return pd.concat(ticker_frames, ignore_index=True), used_ticker, used_fallback
@@ -132,30 +208,35 @@ def _build_ticker_sentiment(news_path, trading_dates, tickers):
         return empty, [], list(tickers)
 
 
-# ── Attach sentiment_ticker to a prices DataFrame ────────────────────────────
+# ── Attach sentiment_ticker; fallback uses sentiment_relevant ─────────────────
 
 def _attach_ticker_sentiment(df_prices, ticker_sent, used_fallback, label):
+    """
+    EDIT 3: Fallback now uses sentiment_relevant (sector-aware) instead of
+    the old binary ENERGY_TICKERS check against sentiment_energy/sentiment_macro.
+    sentiment_relevant must already be present on df_prices before calling this.
+    """
     df = df_prices.copy()
 
     if ticker_sent.empty:
-        df["sentiment_ticker"] = 0.0
+        df["sentiment_ticker"] = df.get("sentiment_relevant", pd.Series(0.0, index=df.index))
         return df
 
     df = df.merge(ticker_sent, on=["date", "ticker"], how="left")
 
     if "sentiment_ticker" not in df.columns:
-        log.warning("%s: sentiment_ticker missing after merge, defaulting to 0", label)
-        df["sentiment_ticker"] = 0.0
+        log.warning("%s: sentiment_ticker missing after merge, defaulting to sentiment_relevant", label)
+        df["sentiment_ticker"] = df.get("sentiment_relevant", 0.0)
         return df
 
+    # Fallback tickers: use their sector-relevant sentiment
     for ticker in used_fallback:
         mask = df["ticker"] == ticker
-        if ticker in ENERGY_TICKERS:
-            df.loc[mask, "sentiment_ticker"] = df.loc[mask, "sentiment_energy"]
-        else:
-            df.loc[mask, "sentiment_ticker"] = df.loc[mask, "sentiment_macro"]
+        df.loc[mask, "sentiment_ticker"] = df.loc[mask, "sentiment_relevant"]
 
-    df["sentiment_ticker"] = df["sentiment_ticker"].fillna(0.0)
+    df["sentiment_ticker"] = df["sentiment_ticker"].fillna(
+        df.get("sentiment_relevant", pd.Series(0.0, index=df.index))
+    )
 
     zeros_pct = (df["sentiment_ticker"] == 0).mean() * 100
     log.info("%s sentiment_ticker mean=%.4f  zeros=%.1f%%  nulls=%d",
@@ -209,18 +290,31 @@ def run():
                      .drop(columns=["date_y", "prev_trading_date"]))
 
     decay_sentiment_cols = [
-        "sentiment_corporate", "sentiment_energy",
-        "sentiment_forex", "sentiment_macro", "news_count",
+        "sentiment_banking", "sentiment_cement", "sentiment_fertilizer",
+        "sentiment_auto", "sentiment_tech", "sentiment_pharma",
+        "sentiment_textile", "sentiment_energy", "sentiment_forex",
+        "sentiment_macro", "sentiment_corporate", "news_count",
     ]
     flags_sentiment_cols = [
-        "sentiment_corporate", "has_corporate",
-        "sentiment_energy",    "has_energy",
-        "sentiment_forex",     "has_forex",
-        "sentiment_macro",     "has_macro",
+        "sentiment_banking",    "has_banking",
+        "sentiment_cement",     "has_cement",
+        "sentiment_fertilizer", "has_fertilizer",
+        "sentiment_auto",       "has_auto",
+        "sentiment_tech",       "has_tech",
+        "sentiment_pharma",     "has_pharma",
+        "sentiment_textile",    "has_textile",
+        "sentiment_energy",     "has_energy",
+        "sentiment_forex",      "has_forex",
+        "sentiment_macro",      "has_macro",
+        "sentiment_corporate",  "has_corporate",
         "news_count",
     ]
-    decay_shifted[decay_sentiment_cols] = decay_shifted[decay_sentiment_cols].fillna(0.0)
-    flags_shifted[flags_sentiment_cols] = flags_shifted[flags_sentiment_cols].fillna(0.0)
+
+    # fillna only for columns that actually exist (graceful if scraper adds cols later)
+    existing_decay = [c for c in decay_sentiment_cols if c in decay_shifted.columns]
+    existing_flags = [c for c in flags_sentiment_cols if c in flags_shifted.columns]
+    decay_shifted[existing_decay] = decay_shifted[existing_decay].fillna(0.0)
+    flags_shifted[existing_flags] = flags_shifted[existing_flags].fillna(0.0)
 
     tickers   = sorted(prices["ticker"].unique().tolist())
     news_path = os.path.join(BASE, "processed", "news_filtered.csv")
@@ -231,6 +325,11 @@ def run():
 
     prices_decay = prices.merge(decay_shifted, on="date", how="left")
     prices_flags = prices.merge(flags_shifted, on="date", how="left")
+
+    # EDIT 3: Build sentiment_relevant BEFORE attaching ticker sentiment
+    # so fallback tickers can use it immediately
+    prices_decay = _build_relevant_sentiment(prices_decay)
+    prices_flags = _build_relevant_sentiment(prices_flags)
 
     prices_decay = _attach_ticker_sentiment(prices_decay, ticker_sent, used_fallback, "DECAY")
     prices_flags = _attach_ticker_sentiment(prices_flags, ticker_sent, used_fallback, "FLAGS")
