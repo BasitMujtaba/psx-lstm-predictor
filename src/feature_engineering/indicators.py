@@ -3,13 +3,20 @@
  File   : src/feature_engineering/indicators.py
  Project: PSX LSTM Predictor
  Purpose: Loads raw OHLCV CSV, cleans dirty rows, computes technical indicators,
-          drops warmup rows, and saves processed CSV.
+          drops warmup rows, saves processed CSV, then splits into per-category
+          CSVs (macro / energy / banking / forex / corporate / unassigned).
 
  Input:
    data/raw/psx_prices/psx_prices_raw.csv
 
  Saves:
    data/processed/psx_prices_processed.csv
+   data/processed/psx_prices_macro.csv
+   data/processed/psx_prices_energy.csv
+   data/processed/psx_prices_banking.csv
+   data/processed/psx_prices_forex.csv
+   data/processed/psx_prices_corporate.csv
+   data/processed/psx_prices_unassigned.csv
 
  Cache logic:
    1. If processed CSV exists and is valid  -> return it directly
@@ -30,6 +37,16 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _EMA_PERIODS = [9, 21, 50, 200]
 _WARMUP_ROWS = 252
+
+# ── Ticker → Category mapping ─────────────────────────────────────────────────
+CATEGORY_TICKERS = {
+    "macro"     : ["DGKC", "EFERT", "FFC", "FATIMA"],
+    "energy"    : ["HUBC", "KAPCO", "MARI", "OGDC", "POL", "PPL", "PSO"],
+    "banking"   : ["BAFL", "HBL", "MCB", "NBP", "UBL"],
+    "forex"     : ["SYS", "TRG", "SEARL", "FEROZ", "NML", "NCL"],
+    "corporate" : ["AVN", "ENGRO", "GATM", "INDU", "LUCK", "MLCF", "PIOC", "PSMC"],
+}
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def load_config(path=None):
@@ -161,6 +178,43 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def save_category_csvs(df: pd.DataFrame, processed_dir: str) -> None:
+    ticker_to_cat = {}
+    for cat, tickers in CATEGORY_TICKERS.items():
+        for t in tickers:
+            ticker_to_cat[t.upper()] = cat
+
+    all_tickers    = set(df["ticker"].str.upper().unique())
+    mapped_tickers = set(ticker_to_cat.keys())
+    unassigned     = sorted(all_tickers - mapped_tickers)
+
+    if unassigned:
+        log.warning("%d tickers not in any category -> psx_prices_unassigned.csv: %s",
+                    len(unassigned), unassigned)
+    else:
+        log.info("All %d tickers successfully mapped to a category.", len(all_tickers))
+
+    df = df.copy()
+    df["_cat"] = df["ticker"].str.upper().map(ticker_to_cat).fillna("unassigned")
+
+    categories = list(CATEGORY_TICKERS.keys()) + (["unassigned"] if unassigned else [])
+
+    log.info("\n── Category CSV summary ─────────────────────────────────────")
+    for cat in categories:
+        cat_df = (df[df["_cat"] == cat]
+                  .drop(columns=["_cat"])
+                  .sort_values(["ticker", "date"])
+                  .reset_index(drop=True))
+
+        out_path = os.path.join(processed_dir, f"psx_prices_{cat}.csv")
+        cat_df.to_csv(out_path, index=False)
+        log.info("  %-12s  %6d rows  %3d tickers  -> %s",
+                 cat, len(cat_df), cat_df["ticker"].nunique(),
+                 os.path.basename(out_path))
+
+    log.info("────────────────────────────────────────────────────────────")
+
+
 def run(cfg=None):
     if cfg is None:
         cfg = load_config()
@@ -174,7 +228,8 @@ def run(cfg=None):
 
     is_valid, cached_df = _processed_cache_valid(processed_path)
     if is_valid:
-        log.info("Returning cached processed data")
+        log.info("Returning cached processed data — regenerating category CSVs ...")
+        save_category_csvs(cached_df, processed_dir)
         return cached_df
 
     if not os.path.exists(raw_path):
@@ -191,6 +246,9 @@ def run(cfg=None):
     processed_df.to_csv(processed_path, index=False)
     log.info("Processed saved -> %s  (%d rows, %.1f MB)",
              processed_path, len(processed_df), os.path.getsize(processed_path) / 1e6)
+
+    save_category_csvs(processed_df, processed_dir)
+
     return processed_df
 
 
