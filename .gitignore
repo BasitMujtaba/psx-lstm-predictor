@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+data/processed/
+data/predictions/
+data/scalers/
+src/models/checkpoints/
+*.png
