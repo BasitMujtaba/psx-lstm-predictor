@@ -4,8 +4,9 @@
  Project: PSX LSTM Predictor
  Purpose: Merge news from Dawn, BRecorder, and Mettis into a single CSV
           keeping only: date | category | title | source | sentiment_score | sentiment_label
-          Categories are standardized to 4 values:
-            macro | corporate | energy | forex
+          Categories are standardized to 11 values:
+            macro | corporate | energy | forex | banking |
+            cement | fertilizer | auto | tech | pharma | textile
           Rows are sorted by date across all sources
           Duplicates removed across all sources and categories
           Irrelevant rows filtered out (foreign/entertainment/sports noise)
@@ -53,20 +54,37 @@ FINBERT_MODEL = "ProsusAI/finbert"
 BATCH_SIZE    = 32
 
 SENTIMENT_COLS = [
+    "sentiment_macro",
     "sentiment_corporate",
     "sentiment_energy",
     "sentiment_forex",
-    "sentiment_macro",
+    "sentiment_banking",
+    "sentiment_cement",
+    "sentiment_fertilizer",
+    "sentiment_auto",
+    "sentiment_tech",
+    "sentiment_pharma",
+    "sentiment_textile",
 ]
 
 DECAY_FACTORS = {
-    "sentiment_corporate" : 0.7,
-    "sentiment_energy"    : 0.7,
-    "sentiment_forex"     : 0.8,
-    "sentiment_macro"     : 0.85,
+    "sentiment_macro"      : 0.85,
+    "sentiment_corporate"  : 0.70,
+    "sentiment_energy"     : 0.70,
+    "sentiment_forex"      : 0.80,
+    "sentiment_banking"    : 0.70,
+    "sentiment_cement"     : 0.70,
+    "sentiment_fertilizer" : 0.70,
+    "sentiment_auto"       : 0.70,
+    "sentiment_tech"       : 0.70,
+    "sentiment_pharma"     : 0.70,
+    "sentiment_textile"    : 0.70,
 }
 
 # ── Category Mapping ──────────────────────────────────────────────────────────
+# Maps raw scraper categories -> standardized internal categories
+# banking kept as banking (was wrongly mapped to corporate before)
+# general_market, general, rates, stocks, exchange added
 CATEGORY_MAP = {
     "macro"                : "macro",
     "fiscal"               : "macro",
@@ -74,16 +92,53 @@ CATEGORY_MAP = {
     "market_political"     : "macro",
     "macro|monetary"       : "macro",
     "macro|fiscal"         : "macro",
+    "general_market"       : "macro",
+    "general"              : "macro",
+    "rates"                : "macro",
     "corporates"           : "corporate",
-    "banking"              : "corporate",
     "equities"             : "corporate",
+    "stocks"               : "corporate",
     "energy|banking"       : "corporate",
     "equities|forex"       : "corporate",
     "equities|commodities" : "corporate",
+    "corporate"            : "corporate",
     "energy"               : "energy",
     "commodities"          : "energy",
     "fiscal|energy"        : "energy",
     "forex"                : "forex",
+    "exchange"             : "forex",
+    "banking"              : "banking",
+}
+
+# ── Sector Keyword Detection ──────────────────────────────────────────────────
+# Applied AFTER category mapping to override category based on title keywords
+# Covers sectors not present as raw categories in any scraper
+SECTOR_KEYWORDS = {
+    "cement"      : [
+        "cement", "clinker", "lucky cement", "dgkc", "dg khan cement",
+        "maple leaf cement", "pioneer cement", "pioc", "mlcf",
+    ],
+    "fertilizer"  : [
+        "fertilizer", "fertiliser", "urea", "dap", "engro fertilizer",
+        "efert", "fauji fertilizer", "ffc", "fatima fertilizer", "fatima",
+    ],
+    "auto"        : [
+        "automobile", "automotive", "indus motor", "pak suzuki", "psmc",
+        "vehicle sales", "car sales", "auto sector", "auto industry",
+    ],
+    "tech"        : [
+        "software export", "technology sector", "trg pakistan",
+        "systems limited", "avanceon", "it sector", "it industry",
+        "tech sector", "it exports",
+    ],
+    "pharma"      : [
+        "pharma", "pharmaceutical", "searle", "ferozsons",
+        "drug pricing", "healthcare sector",
+    ],
+    "textile"     : [
+        "textile", "nishat mills", "nishat chunian", "nml", "ncl",
+        "spinning", "fabric", "yarn", "garment export",
+    ],
 }
 
 
@@ -518,32 +573,32 @@ NON_ECONOMIC = [
 ]
 
 GOLD_TICKER_PATTERN = re.compile(
-    r'gold price[s]?\s+(per tola|gains|sheds|drops|falls|rises|jumps|' 
-    r'increases|decreases|declines|dips|soars|remains|surges|plunges|' 
-    r'climbs|edges|goes|went|up by|up rs|down by|gain|shed|drop|fall|rise|' 
-    r'jump|stable|unchanged|flat|steady|recorded|traded|close|decreased|' 
-    r'increased|decrease|increase|dip|slumps|nosedives|shoots|continues|' 
+    r'gold price[s]?\s+(per tola|gains|sheds|drops|falls|rises|jumps|'
+    r'increases|decreases|declines|dips|soars|remains|surges|plunges|'
+    r'climbs|edges|goes|went|up by|up rs|down by|gain|shed|drop|fall|rise|'
+    r'jump|stable|unchanged|flat|steady|recorded|traded|close|decreased|'
+    r'increased|decrease|increase|dip|slumps|nosedives|shoots|continues|'
     r'in domestic|makes history|remain|per 12)',
     re.IGNORECASE
 )
 GOLD_TICKER_PATTERN2 = re.compile(
-    r'(gold prices (per tola|increase rs|decline rs|increase by|decline by|' 
-    r'remain (stable|unchanged|largely stable|steady)|fall by|fall for|' 
-    r'reverse losing|in pakistan (hit|are|continue|near|remain|reach|soar)|' 
-    r'soar to a new|finally exhibit|reach|come down|surge by|slip|' 
-    r'plummet|clamber|climb|hold|edge|stable|steady|dull|decrease|' 
+    r'(gold prices (per tola|increase rs|decline rs|increase by|decline by|'
+    r'remain (stable|unchanged|largely stable|steady)|fall by|fall for|'
+    r'reverse losing|in pakistan (hit|are|continue|near|remain|reach|soar)|'
+    r'soar to a new|finally exhibit|reach|come down|surge by|slip|'
+    r'plummet|clamber|climb|hold|edge|stable|steady|dull|decrease|'
     r'jump by|gains rs|rise from|per 12 gram|per tola gains|per tola declines))',
     re.IGNORECASE
 )
 GOLD_KEEP_PATTERN = re.compile(
-    r'(why are gold prices|charities report.*gold prices|' 
-    r'stocks.*oil.*gold prices jump|stocks fall.*oil.*gold prices jump|' 
-    r'gold prices.*surpass rs\d|gold prices.*crosses rs\d|' 
-    r'gold prices.*record high in pakistan.*surpass|' 
-    r'gold prices in pakistan.*record rs\d|' 
-    r'gold prices in pakistan soar to another record|' 
-    r'gold prices (soar to record|hit record high in pakistan|' 
-    r'reach record|near all-time high|hit fresh all-time|' 
+    r'(why are gold prices|charities report.*gold prices|'
+    r'stocks.*oil.*gold prices jump|stocks fall.*oil.*gold prices jump|'
+    r'gold prices.*surpass rs\d|gold prices.*crosses rs\d|'
+    r'gold prices.*record high in pakistan.*surpass|'
+    r'gold prices in pakistan.*record rs\d|'
+    r'gold prices in pakistan soar to another record|'
+    r'gold prices (soar to record|hit record high in pakistan|'
+    r'reach record|near all-time high|hit fresh all-time|'
     r'in pakistan reach record|in pakistan hit record))',
     re.IGNORECASE
 )
@@ -602,6 +657,30 @@ def standardize_category(df: pd.DataFrame) -> pd.DataFrame:
     dropped = before - len(df)
     if dropped:
         print(f"   🗑️  Dropped {dropped:,} rows with unmapped category")
+    return df
+
+
+# ── Keyword-based Sector Recategorization ─────────────────────────────────────
+def recategorize_by_keywords(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    After standardize_category(), override category to a specific sector
+    if the article title contains sector-specific keywords.
+    This adds cement, fertilizer, auto, tech, pharma, textile categories
+    which do not exist as raw scraper categories.
+    More specific sectors take priority over generic corporate/macro.
+    """
+    df   = df.copy()
+    t    = df["title"].str.lower().fillna("")
+
+    for sector, keywords in SECTOR_KEYWORDS.items():
+        pattern = "|".join(re.escape(k) for k in keywords)
+        mask    = t.str.contains(pattern, na=False)
+        df.loc[mask, "category"] = sector
+
+    counts = df["category"].value_counts()
+    print(f"   Category distribution after keyword recategorization:")
+    for cat, cnt in counts.items():
+        print(f"     {cat:<15} {cnt:>6,}")
     return df
 
 
@@ -772,6 +851,11 @@ def merge_news() -> pd.DataFrame:
     merged.sort_values("date", inplace=True)
     merged.reset_index(drop=True, inplace=True)
 
+    # keyword recategorization before dedup so sector articles
+    # get correct category going into aggregation
+    print("\n🏷️  Applying keyword-based sector recategorization ...")
+    merged = recategorize_by_keywords(merged)
+
     print("\n🔍 Deduplicating across all sources and categories ...")
     merged = deduplicate(merged)
 
@@ -792,10 +876,17 @@ def _base_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     )
     agg.columns.name = None
     agg = agg.rename(columns={
-        "corporate" : "sentiment_corporate",
-        "energy"    : "sentiment_energy",
-        "forex"     : "sentiment_forex",
-        "macro"     : "sentiment_macro",
+        "macro"       : "sentiment_macro",
+        "corporate"   : "sentiment_corporate",
+        "energy"      : "sentiment_energy",
+        "forex"       : "sentiment_forex",
+        "banking"     : "sentiment_banking",
+        "cement"      : "sentiment_cement",
+        "fertilizer"  : "sentiment_fertilizer",
+        "auto"        : "sentiment_auto",
+        "tech"        : "sentiment_tech",
+        "pharma"      : "sentiment_pharma",
+        "textile"     : "sentiment_textile",
     })
     for col in SENTIMENT_COLS:
         if col not in agg.columns:
@@ -812,22 +903,26 @@ def aggregate_flags(df: pd.DataFrame) -> pd.DataFrame:
     print("\n📊 Building flag aggregation ...")
     agg = _base_aggregate(df)
     flag_map = {
-        "sentiment_corporate" : "has_corporate",
-        "sentiment_energy"    : "has_energy",
-        "sentiment_forex"     : "has_forex",
-        "sentiment_macro"     : "has_macro",
+        "sentiment_macro"      : "has_macro",
+        "sentiment_corporate"  : "has_corporate",
+        "sentiment_energy"     : "has_energy",
+        "sentiment_forex"      : "has_forex",
+        "sentiment_banking"    : "has_banking",
+        "sentiment_cement"     : "has_cement",
+        "sentiment_fertilizer" : "has_fertilizer",
+        "sentiment_auto"       : "has_auto",
+        "sentiment_tech"       : "has_tech",
+        "sentiment_pharma"     : "has_pharma",
+        "sentiment_textile"    : "has_textile",
     }
     for sent_col, flag_col in flag_map.items():
         agg[flag_col] = agg[sent_col].notna().astype(float)
     agg[SENTIMENT_COLS] = agg[SENTIMENT_COLS].fillna(0.0)
-    col_order = [
-        "date",
-        "sentiment_corporate", "has_corporate",
-        "sentiment_energy",    "has_energy",
-        "sentiment_forex",     "has_forex",
-        "sentiment_macro",     "has_macro",
-        "news_count",
-    ]
+    col_order = (
+        ["date"] +
+        [c for pair in zip(SENTIMENT_COLS, flag_map.values()) for c in pair] +
+        ["news_count"]
+    )
     agg = agg[col_order]
     print(f"   ✅ Flags done — shape: {agg.shape}")
     return agg
@@ -846,7 +941,7 @@ def aggregate_decay(df: pd.DataFrame) -> pd.DataFrame:
             if pd.isna(values.iloc[i]):
                 values.iloc[i] = values.iloc[i - 1] * factor
         agg[col] = values
-        print(f"   {col:<25} decay={factor}")
+        print(f"   {col:<30} decay={factor}")
     agg[SENTIMENT_COLS] = agg[SENTIMENT_COLS].fillna(0.0).round(4)
     agg = agg.reset_index()
     agg.sort_values("date", inplace=True)
@@ -886,7 +981,7 @@ def run():
     sanity_check(df)
     push_to_github(
         [str(OUTPUT_PATH.relative_to(BASE_DIR))],
-        "Update news_merged.csv — deduped + FinBERT"
+        "Update news_merged.csv — deduped + FinBERT + 11 sector categories"
     )
 
     # ── Step 2: Filter irrelevant articles ───────────────────────────────────
@@ -906,7 +1001,7 @@ def run():
     print(f"💾 Saved flags  → {FLAGS_PATH}  ({len(flags_df):,} rows)")
     push_to_github(
         [str(FLAGS_PATH.relative_to(BASE_DIR))],
-        "Update news_aggregated_flags.csv"
+        "Update news_aggregated_flags.csv — 11 sector categories"
     )
 
     print("\n" + "=" * 60)
@@ -915,7 +1010,7 @@ def run():
     print(f"💾 Saved decay  → {DECAY_PATH}  ({len(decay_df):,} rows)")
     push_to_github(
         [str(DECAY_PATH.relative_to(BASE_DIR))],
-        "Update news_aggregated_decay_catwise.csv"
+        "Update news_aggregated_decay_catwise.csv — 11 sector categories"
     )
 
     print("\n" + "=" * 60)
